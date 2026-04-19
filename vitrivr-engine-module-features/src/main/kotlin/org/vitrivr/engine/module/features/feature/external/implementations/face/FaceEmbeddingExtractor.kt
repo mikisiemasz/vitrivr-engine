@@ -11,40 +11,53 @@ import org.vitrivr.engine.core.operators.Operator
 import org.vitrivr.engine.core.operators.ingest.Extractor
 
 /**
- * [FaceEmbeddingExtractor] implementation of an [AbstractExtractor] for [FaceEmbedding].
+ * [FaceEmbeddingExtractor] — returns one [FloatVectorDescriptor] **per detected face**.
  *
- * Calls the external ArcFace descriptor server at /extract/face_embedding
- * and returns a single 512-d [FloatVectorDescriptor] (L2-normalised mean of all detected faces).
+ * If a frame contains 3 faces, 3 descriptors are stored, all sharing the same [Retrievable.id].
+ * If no faces are detected, an empty list is returned (nothing stored).
  */
 class FaceEmbeddingExtractor : AbstractExtractor<ImageContent, FloatVectorDescriptor> {
 
     private val host: String
 
-    constructor(input: Operator<out Retrievable>, analyser: FaceEmbedding, field: Schema.Field<ImageContent, FloatVectorDescriptor>, host: String) : super(input, analyser, field) {
+    constructor(
+        input: Operator<out Retrievable>,
+        analyser: FaceEmbedding,
+        field: Schema.Field<ImageContent, FloatVectorDescriptor>,
+        host: String
+    ) : super(input, analyser, field) {
         this.host = host
     }
 
-    constructor(input: Operator<out Retrievable>, analyser: FaceEmbedding, name: String, host: String) : super(input, analyser, name) {
+    constructor(
+        input: Operator<out Retrievable>,
+        analyser: FaceEmbedding,
+        name: String,
+        host: String
+    ) : super(input, analyser, name) {
         this.host = host
     }
 
-    /**
-     * Internal method to check, if [Retrievable] matches this [Extractor] and should thus be processed.
-     *
-     * @param retrievable The [Retrievable] to check.
-     * @return True on match, false otherwise.
-     */
     override fun matches(retrievable: Retrievable): Boolean =
         retrievable.content.any { it.type == ContentType.BITMAP_IMAGE }
 
     /**
-     * Internal method to perform extraction on [Retrievable].
+     * Extracts face embeddings from the [Retrievable].
      *
      * @param retrievable The [Retrievable] to process.
-     * @return List of resulting [Descriptor]s.
+     * @return List of [FloatVectorDescriptor]s — one per detected face, possibly empty.
      */
-    override fun extract(retrievable: Retrievable): List<FloatVectorDescriptor> =
-        retrievable.content.filterIsInstance<ImageContent>().map { c ->
-            FaceEmbedding.analyse(c, this.host).copy(retrievableId = retrievable.id, field = this@FaceEmbeddingExtractor.field)
-        }
+    override fun extract(retrievable: Retrievable): List<FloatVectorDescriptor> {
+        return retrievable.content
+            .filterIsInstance<ImageContent>()
+            .flatMap { imageContent ->
+                // analyse() now returns List<FloatVectorDescriptor>, one per face
+                FaceEmbedding.analyse(imageContent, this.host).map { descriptor ->
+                    descriptor.copy(
+                        retrievableId = retrievable.id,
+                        field = this@FaceEmbeddingExtractor.field
+                    )
+                }
+            }
+    }
 }
