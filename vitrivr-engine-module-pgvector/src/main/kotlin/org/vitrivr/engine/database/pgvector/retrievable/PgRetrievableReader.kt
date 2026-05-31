@@ -115,6 +115,23 @@ class PgRetrievableReader(override val connection: PgVectorConnection): Retrieva
     }
 
     /**
+     * Returns all [Retrieved]s whose type matches the provided [type] string.
+     *
+     * @param type The retrievable type to filter by (e.g. "FACE_DETECTION").
+     * @return A [Sequence] of matching [Retrieved]s.
+     */
+    override fun getAll(type: String): Sequence<Retrieved> = transaction(this.connection.database) {
+        try {
+            RetrievableTable.selectAll().where { RetrievableTable.type eq type }.map { row ->
+                row.toRetrieved()
+            }.asSequence()
+        } catch (e: Throwable) {
+            LOGGER.error(e) { "Failed to fetch retrievables of type '$type' due to SQL error." }
+            throw e
+        }
+    }
+
+    /**
      * Counts the number of [Retrievable] stored by the database.
      *
      * @return The number of [Retrievable]s.

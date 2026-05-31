@@ -5,8 +5,10 @@ import com.github.ajalt.clikt.core.Context
 import com.github.ajalt.clikt.core.NoOpCliktCommand
 import com.github.ajalt.clikt.core.subcommands
 import com.github.ajalt.clikt.parameters.options.convert
+import com.github.ajalt.clikt.parameters.options.default
 import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.options.required
+import com.github.ajalt.clikt.parameters.types.int
 import com.jakewharton.picnic.table
 import io.github.oshai.kotlinlogging.KLogger
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -18,6 +20,10 @@ import org.vitrivr.engine.core.database.Initializer
 import org.vitrivr.engine.core.model.metamodel.Schema
 import org.vitrivr.engine.core.model.metamodel.SchemaManager
 import org.vitrivr.engine.core.model.relationship.Relationship
+import org.vitrivr.engine.module.features.feature.external.ExternalAnalyser.Companion.HOST_PARAMETER_DEFAULT
+import org.vitrivr.engine.module.features.feature.external.ExternalAnalyser.Companion.HOST_PARAMETER_NAME
+import org.vitrivr.engine.server.services.ClusteringParams
+import org.vitrivr.engine.server.services.FaceClusteringService
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.*
@@ -37,7 +43,8 @@ class SchemaCommand(private val schema: Schema, private val server: ExecutionSer
             Initialize(),
             Extract(this.schema, this.server),
             Status(this.server),
-            MigrateTo(this.schema, this.manager)
+            MigrateTo(this.schema, this.manager),
+            Cluster(this.schema)
         )
     }
 
@@ -215,6 +222,61 @@ class SchemaCommand(private val schema: Schema, private val server: ExecutionSer
          */
         override fun run() {
             logger.info { "Status: ${executor.status(jobId)} at ${System.currentTimeMillis()}" }
+        }
+    }
+
+    /**
+     * [CliktCommand] to run face clustering on the stored FACE_DETECTION retrievables.
+     *
+     * Usage: `<schema> cluster [--embedding-field face] [--min-cluster-size 5] [--min-samples 3] [--python-server <url>]`
+     *
+     * If `--python-server` is omitted the URL is taken from the embedding field's `host` parameter
+     * in the schema config (same source the extractors use).
+     */
+    inner class Cluster(private val schema: Schema) : CliktCommand(name = "cluster") {
+
+        private val logger: KLogger = KotlinLogging.logger {}
+
+        private val embeddingField: String by option(
+            "--embedding-field",
+            help = "Schema field name holding face embeddings."
+        ).default("face")
+
+        private val minClusterSize: Int by option(
+            "--min-cluster-size",
+            help = "HDBSCAN min_cluster_size."
+        ).int().default(5)
+
+        private val minSamples: Int by option(
+            "--min-samples",
+            help = "HDBSCAN min_samples."
+        ).int().default(3)
+
+        private val pythonServer: String? by option(
+            "--python-server",
+            help = "Base URL of the Python descriptor server. Defaults to the '$HOST_PARAMETER_NAME' " +
+                    "parameter of the embedding field in the schema config."
+        )
+
+        override fun help(context: Context): String =
+            "Clusters stored FACE_DETECTION retrievables using HDBSCAN via the Python descriptor server."
+
+        override fun run() {
+            val resolvedHost = pythonServer
+                ?: schema[embeddingField]?.parameters?.get(HOST_PARAMETER_NAME)
+                ?: HOST_PARAMETER_DEFAULT
+
+            val params = ClusteringParams(
+                embeddingFieldName = embeddingField,
+                minClusterSize = minClusterSize,
+                minSamples = minSamples,
+                pythonServerUrl = resolvedHost,
+            )
+            logger.info { "Starting face clustering with params: $params" }
+            val result = FaceClusteringService(schema).run(params)
+            println("Clustering run ${result.runId} completed: status=${result.status}, " +
+                    "clusters=${result.numClusters}, assigned=${result.numAssignedFaces}, " +
+                    "noise=${result.numNoiseFaces}")
         }
     }
 

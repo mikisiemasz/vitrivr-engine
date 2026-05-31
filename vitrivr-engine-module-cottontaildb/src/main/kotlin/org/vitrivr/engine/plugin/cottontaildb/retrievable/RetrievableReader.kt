@@ -134,6 +134,34 @@ internal class RetrievableReader(override val connection: CottontailConnection) 
     }
 
     /**
+     * Returns all [Retrievable]s whose type matches the provided [type] string.
+     *
+     * @param type The retrievable type to filter by (e.g. "FACE_DETECTION").
+     * @return A [Sequence] of matching [Retrieved]s.
+     */
+    override fun getAll(type: String): Sequence<Retrieved> {
+        val query = Query(this.entityName).select("*").where(
+            Compare(
+                Column(this.entityName.column(RETRIEVABLE_TYPE_COLUMN_NAME)),
+                Compare.Operator.EQUAL,
+                Literal(StringValue(type))
+            )
+        )
+        return try {
+            this.connection.client.query(query).asSequence().map { tuple ->
+                val retrievableId = tuple.asUuidValue(RETRIEVABLE_ID_COLUMN_NAME)?.value
+                    ?: throw IllegalArgumentException("The provided tuple is missing the required field '${RETRIEVABLE_ID_COLUMN_NAME}'.")
+                val t = tuple.asString(RETRIEVABLE_TYPE_COLUMN_NAME)
+                    ?: throw IllegalArgumentException("The provided tuple is missing the required field '${RETRIEVABLE_TYPE_COLUMN_NAME}'.")
+                Retrieved(retrievableId, t, transient = false)
+            }
+        } catch (e: StatusRuntimeException) {
+            logger.error(e) { "Failed to fetch retrievables of type '$type' due to exception." }
+            emptySequence()
+        }
+    }
+
+    /**
      * Counts the number of retrievables stored by the database.
      *
      * @return The number of [Retrievable]s.

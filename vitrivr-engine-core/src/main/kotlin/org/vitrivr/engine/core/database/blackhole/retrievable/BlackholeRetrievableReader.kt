@@ -18,6 +18,7 @@ class BlackholeRetrievableReader(override val connection: BlackholeConnection) :
     override fun exists(id: RetrievableId): Boolean = false
     override fun getAll(ids: Iterable<RetrievableId>) = emptySequence<Retrieved>()
     override fun getAll() = emptySequence<Retrieved>()
+    override fun getAll(type: String) = emptySequence<Retrieved>()
     override fun getConnections(subjectIds: Collection<RetrievableId>, predicates: Collection<String>, objectIds: Collection<RetrievableId>) = emptySequence<Relationship.ById>()
     override fun count(): Long = 0L
 }

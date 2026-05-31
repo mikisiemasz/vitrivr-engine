@@ -3,18 +3,22 @@ package org.vitrivr.engine.module.features.feature.external.implementations.face
 import org.vitrivr.engine.core.features.AbstractExtractor
 import org.vitrivr.engine.core.model.content.ContentType
 import org.vitrivr.engine.core.model.content.element.ImageContent
-import org.vitrivr.engine.core.model.descriptor.Descriptor
 import org.vitrivr.engine.core.model.descriptor.vector.FloatVectorDescriptor
 import org.vitrivr.engine.core.model.metamodel.Schema
 import org.vitrivr.engine.core.model.retrievable.Retrievable
+import org.vitrivr.engine.core.model.types.Value
 import org.vitrivr.engine.core.operators.Operator
-import org.vitrivr.engine.core.operators.ingest.Extractor
+import java.util.*
 
 /**
  * [FaceEmbeddingExtractor] — returns one [FloatVectorDescriptor] **per detected face**.
  *
- * If a frame contains 3 faces, 3 descriptors are stored, all sharing the same [Retrievable.id].
- * If no faces are detected, an empty list is returned (nothing stored).
+ * This extractor attaches face embeddings to the incoming retrievable. Each descriptor shares the parent retrievable's ID.
+ *
+ * After re-extraction using [FaceDetectionTransformer], face embeddings will instead
+ * be stored on dedicated FACE_DETECTION retrievables with a `partOf` relationship to
+ * the parent. Until then, this extractor keeps the legacy pipeline working. 
+ * TODO: remove the previous version support
  */
 class FaceEmbeddingExtractor : AbstractExtractor<ImageContent, FloatVectorDescriptor> {
 
@@ -44,20 +48,23 @@ class FaceEmbeddingExtractor : AbstractExtractor<ImageContent, FloatVectorDescri
     /**
      * Extracts face embeddings from the [Retrievable].
      *
+     * Calls the Python server via [FaceEmbedding.analyse], maps each [FaceDetectionResult]
+     * to a [FloatVectorDescriptor] bound to the parent retrievable's ID.
+     *
      * @param retrievable The [Retrievable] to process.
      * @return List of [FloatVectorDescriptor]s — one per detected face, possibly empty.
      */
-    override fun extract(retrievable: Retrievable): List<FloatVectorDescriptor> {
-        return retrievable.content
+    override fun extract(retrievable: Retrievable): List<FloatVectorDescriptor> =
+        retrievable.content
             .filterIsInstance<ImageContent>()
             .flatMap { imageContent ->
-                // analyse() now returns List<FloatVectorDescriptor>, one per face
-                FaceEmbedding.analyse(imageContent, this.host).map { descriptor ->
-                    descriptor.copy(
+                FaceEmbedding.analyse(imageContent, this.host).map { det ->
+                    FloatVectorDescriptor(
+                        id = UUID.randomUUID(),
                         retrievableId = retrievable.id,
+                        vector = Value.FloatVector(det.embedding.toFloatArray()),
                         field = this@FaceEmbeddingExtractor.field
                     )
                 }
             }
-    }
 }

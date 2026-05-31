@@ -47,4 +47,12 @@ interface RetrievableReader : Reader<Retrieved> {
      * @param objectIds The [UUID]s of the objects to consider.  If empty, all subjects are considered.
      */
     fun getConnections(subjectIds: Collection<RetrievableId>, predicates: Collection<String>, objectIds: Collection<RetrievableId>): Sequence<Relationship.ById>
+
+    /**
+     * Returns a [Sequence] of all [Retrievable]s whose type matches the given [type] string.
+     *
+     * @param type The retrievable type string to filter by (e.g. "FACE_DETECTION").
+     * @return [Sequence] of matching [Retrieved]s.
+     */
+    fun getAll(type: String): Sequence<Retrieved>
 }

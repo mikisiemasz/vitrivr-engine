@@ -1,5 +1,6 @@
 plugins {
     id 'common-conventions-with-publish'
+    id 'org.jetbrains.kotlin.plugin.serialization' version "$version_kotlin"
 }
 
 dependencies {

@@ -8,6 +8,7 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.utils.io.jvm.javaio.*
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
 import org.vitrivr.engine.core.context.Context
@@ -43,30 +44,40 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
 
     companion object {
         /**
-         * Requests per-face ArcFace embeddings for the given [ContentElement].
+         * Requests per-face ArcFace detections for the given [ContentElement].
          *
-         * The Python server returns a JSON array of float arrays:
+         * The Python server returns a JSON array of [FaceDetectionResult] objects:
          *   - 0 faces → `[]`
-         *   - N faces → `[[512 floats], [512 floats], ...]`
+         *   - N faces → `[{embedding, bbox, score}, ...]`
          *
-         * @param content The [ContentElement] for which to request face embeddings.
+         * @param content  The [ContentElement] for which to request face detections.
          * @param hostname The hostname of the external feature descriptor service.
-         * @return A list of 512-d [FloatVectorDescriptor]s, one per detected face.
+         * @return A list of [FaceDetectionResult]s, one per detected face.
          */
-        fun analyse(content: ContentElement<*>, hostname: String): List<FloatVectorDescriptor> {
+        fun analyse(content: ContentElement<*>, hostname: String): List<FaceDetectionResult> {
             val requestBody = when (content) {
                 is ImageContent -> URLEncoder.encode(content.toDataUrl(), StandardCharsets.UTF_8.toString())
                 else -> throw IllegalArgumentException("Content '$content' not supported")
             }
             val url = "$hostname/extract/face_embedding"
-            return httpRequestMulti(url, "data=$requestBody")
+            return httpRequestDetailed(url, "data=$requestBody")
         }
 
         /**
-         * HTTP request that deserializes a JSON array of float arrays into
-         * a list of [FloatVectorDescriptor]s.
+         * Convenience wrapper: calls [analyse] and extracts just the embedding vectors as
+         * [FloatVectorDescriptor]s. Used by [FaceEmbeddingExtractor] and retrieval paths
+         * that only need the embedding.
          */
-        private fun httpRequestMulti(url: String, requestBody: String): List<FloatVectorDescriptor> = runBlocking {
+        fun analyseEmbeddings(content: ContentElement<*>, hostname: String): List<FloatVectorDescriptor> =
+            analyse(content, hostname).map { det ->
+                FloatVectorDescriptor(UUID.randomUUID(), null, Value.FloatVector(det.embedding.toFloatArray()))
+            }
+
+        /**
+         * HTTP request that deserializes the rich per-face JSON response from the Python server.
+         */
+        @OptIn(ExperimentalSerializationApi::class)
+        private fun httpRequestDetailed(url: String, requestBody: String): List<FaceDetectionResult> = runBlocking {
             val body = requestBody.toByteArray(StandardCharsets.UTF_8)
             val client = try {
                 HttpClient(CIO) {
@@ -94,17 +105,8 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
                     return@runBlocking emptyList()
                 }
 
-                val bytes = response.bodyAsChannel().toInputStream()
-                val embeddings: List<FloatArray> = bytes.use { stream ->
-                    Json.decodeFromStream<List<FloatArray>>(stream)
-                }
-
-                embeddings.map { emb ->
-                    FloatVectorDescriptor(
-                        UUID.randomUUID(),
-                        null,
-                        Value.FloatVector(emb)
-                    )
+                response.bodyAsChannel().toInputStream().use { stream ->
+                    Json.decodeFromStream<List<FaceDetectionResult>>(stream)
                 }
             } catch (e: Throwable) {
                 logger.error(e) { "Error during face embedding API call to $url." }
@@ -162,8 +164,7 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
         context: Context
     ): DenseRetriever<ImageContent> {
         val host = field.parameters[HOST_PARAMETER_NAME] ?: HOST_PARAMETER_DEFAULT
-        // For retrieval, use the first face from the query image
-        val descriptors = content.values.flatMap { analyse(it, host) }
+        val descriptors = content.values.flatMap { analyseEmbeddings(it, host) }
         require(descriptors.isNotEmpty()) { "No faces detected in the query image." }
         return newRetrieverForDescriptors(field, descriptors, context)
     }
@@ -175,7 +176,6 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
     ): DenseRetriever<ImageContent> {
         val k = context.getProperty(field.fieldName, "limit")?.toLongOrNull() ?: 1000L
         val fetchVector = context.getProperty(field.fieldName, "returnDescriptor")?.toBooleanStrictOrNull() ?: false
-        // Use the first descriptor as the query vector
         return this.newRetrieverForQuery(
             field,
             ProximityQuery(

@@ -4,6 +4,10 @@ import io.javalin.apibuilder.ApiBuilder.*
 import org.vitrivr.engine.core.config.pipeline.execution.ExecutionServer
 import org.vitrivr.engine.core.model.metamodel.SchemaManager
 import org.vitrivr.engine.server.api.rest.handlers.*
+import org.vitrivr.engine.server.api.rest.handlers.listClusterRuns
+import org.vitrivr.engine.server.api.rest.handlers.triggerClustering
+import org.vitrivr.engine.server.api.rest.handlers.listClusters
+import org.vitrivr.engine.server.api.rest.handlers.getClusterMembers
 import org.vitrivr.engine.server.config.ApiConfig
 
 
@@ -40,6 +44,16 @@ fun configureApiRoutes(config: ApiConfig, manager: SchemaManager, executor: Exec
 
                 if (config.retrieval) {
                     post("query") { ctx -> executeQuery(ctx, schema, executor) }
+                }
+
+                /* Cluster endpoints (always enabled when retrieval or index is active) */
+                if (config.retrieval || config.index) {
+                    path("clusters") {
+                        get { ctx -> listClusters(ctx, schema) }
+                        get("runs") { ctx -> listClusterRuns(ctx, schema) }
+                        post("run") { ctx -> triggerClustering(ctx, schema) }
+                        get("{clusterId}/members") { ctx -> getClusterMembers(ctx, schema) }
+                    }
                 }
 
                 if (config.export) {
