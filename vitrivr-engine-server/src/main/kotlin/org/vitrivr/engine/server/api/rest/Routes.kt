@@ -52,7 +52,13 @@ fun configureApiRoutes(config: ApiConfig, manager: SchemaManager, executor: Exec
                         get { ctx -> listClusters(ctx, schema) }
                         get("runs") { ctx -> listClusterRuns(ctx, schema) }
                         post("run") { ctx -> triggerClustering(ctx, schema) }
+                        post("merge") { ctx -> mergeClusters(ctx, schema) }
                         get("{clusterId}/members") { ctx -> getClusterMembers(ctx, schema) }
+                        get("{clusterId}/centroid") { ctx -> getClusterCentroid(ctx, schema) }
+                        get("{clusterId}/segments") { ctx -> getClusterSegments(ctx, schema) }
+                        get("{clusterId}/co-occurrences") { ctx -> getClusterCoOccurrences(ctx, schema) }
+                        patch("{clusterId}/label") { ctx -> patchClusterLabel(ctx, schema) }
+                        post("{clusterId}/split") { ctx -> splitCluster(ctx, schema) }
                     }
                 }
 
