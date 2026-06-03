@@ -107,7 +107,11 @@ class PgVectorConnectionProvider: AbstractConnectionProvider() {
         val host = parameters.getOrDefault(PARAMETER_NAME_HOST, PARAMETER_DEFAULT_HOST)
         val port = parameters[PARAMETER_NAME_PORT]?.toInt() ?: PARAMETER_DEFAULT_PORT
         val database = parameters[PARAMETER_NAME_DATABASE] ?: PARAMETER_DEFAULT_DATABASE
-        val url = "jdbc:postgresql://${host}:${port}/${database}"
+        /* currentSchema sets search_path on every new connection so DDL run in fresh
+           transactions (e.g. PgRetrievableInitializer) lands in the right SQL schema.
+           Include 'public' as a secondary so the pgvector extension's 'vector' type
+           (created in public) is still resolvable. */
+        val url = "jdbc:postgresql://${host}:${port}/${database}?currentSchema=${schemaName.lowercase()},public"
 
         /* Prepare properties (optional). */
         val username = parameters[PARAMETER_NAME_USERNAME] ?: "postgres"
