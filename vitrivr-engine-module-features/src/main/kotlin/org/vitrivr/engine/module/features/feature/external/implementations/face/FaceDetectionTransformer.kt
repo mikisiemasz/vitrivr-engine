@@ -45,9 +45,12 @@ import java.util.*
 class FaceDetectionTransformer : OperatorFactory {
 
     override fun newOperator(name: String, inputs: Map<String, Operator<out Retrievable>>, context: Context): Transformer {
-        val host = context[name, HOST_PARAMETER_NAME] ?: HOST_PARAMETER_DEFAULT
         val embeddingFieldName = context[name, "embeddingField"] ?: "face"
-        return Instance(inputs.values.first() as Operator<Retrievable>, name, context, host, embeddingFieldName)
+        val bboxFieldName = context[name, "bboxField"] ?: "facebbox"
+        val host = context[name, HOST_PARAMETER_NAME]
+            ?: context.schema[embeddingFieldName]?.parameters?.get(HOST_PARAMETER_NAME)
+            ?: HOST_PARAMETER_DEFAULT
+        return Instance(inputs.values.first() as Operator<Retrievable>, name, context, host, embeddingFieldName, bboxFieldName)
     }
 
     /**
@@ -59,6 +62,7 @@ class FaceDetectionTransformer : OperatorFactory {
         private val context: Context,
         private val host: String,
         private val embeddingFieldName: String,
+        private val bboxFieldName: String,
     ) : Transformer {
 
         private val logger: KLogger = KotlinLogging.logger("FaceDetectionTransformer#$name")
@@ -75,6 +79,15 @@ class FaceDetectionTransformer : OperatorFactory {
         @Suppress("UNCHECKED_CAST")
         private val embeddingField: Schema.Field<ImageContent, FloatVectorDescriptor>? by lazy {
             context.schema[embeddingFieldName] as? Schema.Field<ImageContent, FloatVectorDescriptor>
+        }
+
+        /**
+         * Lazily resolved bounding-box field. Null when the field is not configured in the schema —
+         * in that case bbox storage is silently skipped.
+         */
+        @Suppress("UNCHECKED_CAST")
+        private val bboxField: Schema.Field<ImageContent, FloatVectorDescriptor>? by lazy {
+            context.schema[bboxFieldName] as? Schema.Field<ImageContent, FloatVectorDescriptor>
         }
 
         override fun toFlow(scope: CoroutineScope): Flow<Retrievable> =
@@ -97,7 +110,12 @@ class FaceDetectionTransformer : OperatorFactory {
 
                 if (detections.isEmpty()) return@map retrievable
 
-                val writer = embeddingField?.getWriter()
+                val embeddingWriter = embeddingField?.getWriter()
+                val bboxWriter = bboxField?.getWriter()
+
+                /* Source frame dimensions, used to normalize the bbox to [0, 1]^4. */
+                val frameW = imageContent.width.toFloat().coerceAtLeast(1f)
+                val frameH = imageContent.height.toFloat().coerceAtLeast(1f)
 
                 for (det in detections) {
                     val faceId = UUID.randomUUID()
@@ -112,7 +130,7 @@ class FaceDetectionTransformer : OperatorFactory {
                     )
 
                     // Persist the face embedding descriptor
-                    writer?.add(
+                    embeddingWriter?.add(
                         FloatVectorDescriptor(
                             id = UUID.randomUUID(),
                             retrievableId = faceId,
@@ -120,6 +138,25 @@ class FaceDetectionTransformer : OperatorFactory {
                             field = embeddingField
                         )
                     )
+
+                    /* Persist the bounding box as a 4-d FloatVectorDescriptor normalized to [0,1]^4.
+                       Python returns [x1, y1, x2, y2] in original frame pixel coords. */
+                    if (bboxWriter != null && det.bbox.size >= 4) {
+                        val normalized = floatArrayOf(
+                            (det.bbox[0] / frameW).coerceIn(0f, 1f),
+                            (det.bbox[1] / frameH).coerceIn(0f, 1f),
+                            (det.bbox[2] / frameW).coerceIn(0f, 1f),
+                            (det.bbox[3] / frameH).coerceIn(0f, 1f),
+                        )
+                        bboxWriter.add(
+                            FloatVectorDescriptor(
+                                id = UUID.randomUUID(),
+                                retrievableId = faceId,
+                                vector = Value.FloatVector(normalized),
+                                field = bboxField
+                            )
+                        )
+                    }
                 }
 
                 logger.trace { "Persisted ${detections.size} FACE_DETECTION(s) for retrievable ${retrievable.id}" }

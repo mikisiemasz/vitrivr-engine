@@ -25,7 +25,6 @@ import org.vitrivr.engine.core.model.query.proximity.ProximityQuery
 import org.vitrivr.engine.core.model.retrievable.Retrievable
 import org.vitrivr.engine.core.model.types.Value
 import org.vitrivr.engine.core.operators.Operator
-import org.vitrivr.engine.core.operators.ingest.Extractor
 import org.vitrivr.engine.core.operators.retrieve.Retriever
 import org.vitrivr.engine.module.features.feature.external.ExternalAnalyser
 import org.vitrivr.engine.module.features.feature.external.logger
@@ -123,23 +122,27 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
     override fun prototype(field: Schema.Field<*, *>) =
         FloatVectorDescriptor(UUID.randomUUID(), UUID.randomUUID(), Value.FloatVector(512))
 
+    /* FaceEmbedding is wired into the pipeline via FaceDetectionTransformer (which writes face
+       embeddings as descriptors on FACE_DETECTION retrievables).*/
     override fun newExtractor(
         field: Schema.Field<ImageContent, FloatVectorDescriptor>,
         input: Operator<out Retrievable>,
         context: Context
-    ): FaceEmbeddingExtractor {
-        val host: String = field.parameters[HOST_PARAMETER_NAME] ?: HOST_PARAMETER_DEFAULT
-        return FaceEmbeddingExtractor(input, this, field, host)
-    }
+    ): org.vitrivr.engine.core.operators.ingest.Extractor<ImageContent, FloatVectorDescriptor> =
+        throw UnsupportedOperationException(
+            "FaceEmbedding does not provide a standalone extractor. " +
+                    "Wire face extraction via FaceDetectionTransformer in your ingest pipeline."
+        )
 
     override fun newExtractor(
         name: String,
         input: Operator<out Retrievable>,
         context: Context
-    ): FaceEmbeddingExtractor {
-        val host: String = context.getProperty(name, HOST_PARAMETER_NAME) ?: HOST_PARAMETER_DEFAULT
-        return FaceEmbeddingExtractor(input, this, name, host)
-    }
+    ): org.vitrivr.engine.core.operators.ingest.Extractor<ImageContent, FloatVectorDescriptor> =
+        throw UnsupportedOperationException(
+            "FaceEmbedding does not provide a standalone extractor. " +
+                    "Wire face extraction via FaceDetectionTransformer in your ingest pipeline."
+        )
 
     override fun newRetrieverForQuery(
         field: Schema.Field<ImageContent, FloatVectorDescriptor>,

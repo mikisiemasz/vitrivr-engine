@@ -61,11 +61,15 @@ data class ClusterGalleryResponse(
 
 /**
  * One member of a cluster (a FACE_DETECTION retrievable).
+ *
+ * [bbox] (when present) is `[x1, y1, x2, y2]` normalized to `[0, 1]^4` against the source frame.
+ * Render by multiplying by the displayed image dimensions.
  */
 @Serializable
 data class ClusterMemberItem(
     val faceId: String,
     val parentId: String?,
+    val bbox: List<Float>? = null,
 )
 
 /**
@@ -168,4 +172,52 @@ data class ClusterMutationResult(
 data class ClusterCentroidResponse(
     val clusterId: String,
     val embedding: List<Float>,
+)
+
+/**
+ * One bin in the group-size histogram. [k] is the number of distinct clusters present in a
+ * segment, [segmentCount] is how many segments have exactly that many distinct clusters.
+ */
+@Serializable
+data class GroupSizeBin(val k: Int, val segmentCount: Int)
+
+/** Response for `GET /clusters/stats/group-sizes`. */
+@Serializable
+data class GroupSizeHistogramResponse(
+    val totalSegments: Int,
+    val bins: List<GroupSizeBin>,
+)
+
+/**
+ * Request body for `POST /clusters/match`.
+ *
+ * Server-side AND-intersection of cluster memberships, replacing the multi-query intersection
+ * the frontend currently does. Returns exactly the segments where every cluster in [include]
+ * has at least one member and none of the clusters in [exclude] do.
+ *
+ * Optional [spatialOrder] adds a left-to-right (or top-to-bottom) constraint: among the segments
+ * that satisfy the include/exclude clauses, only segments where the listed clusters appear in
+ * the requested order along [axis] are returned. The score is the mean margin between
+ * consecutive positions — larger is cleaner.
+ */
+@Serializable
+data class ClusterMatchRequest(
+    val include: List<String> = emptyList(),
+    val exclude: List<String> = emptyList(),
+    val spatialOrder: List<String>? = null,
+    val axis: String = "x",
+    val limit: Int = 200,
+)
+
+@Serializable
+data class ClusterMatchHit(
+    val segmentId: String,
+    val score: Float,
+)
+
+@Serializable
+data class ClusterMatchResponse(
+    val total: Int,
+    val limit: Int,
+    val results: List<ClusterMatchHit>,
 )

@@ -252,8 +252,25 @@ fun getClusterMembers(ctx: Context, schema: Schema) {
     }
 
     val parents = parentMapOf(schema, memberIds)
-    val page = memberIds.drop(offset).take(limit).map { faceId ->
-        ClusterMemberItem(faceId = faceId.toString(), parentId = parents[faceId]?.toString())
+    val pageIds = memberIds.drop(offset).take(limit)
+
+    /* Load bbox descriptors for just this page's members, in chunks (Postgres' 65k param cap). */
+    @Suppress("UNCHECKED_CAST")
+    val bboxField = schema["facebbox"] as? Schema.Field<*, FloatVectorDescriptor>
+    val bboxByMember: Map<UUID, List<Float>> = bboxField?.let { f ->
+        val reader = f.getReader()
+        pageIds.chunked(30_000)
+            .flatMap { batch -> reader.getAllForRetrievable(batch).toList() }
+            .mapNotNull { d -> d.retrievableId?.let { it to d.vector.value.toList() } }
+            .toMap()
+    } ?: emptyMap()
+
+    val page = pageIds.map { faceId ->
+        ClusterMemberItem(
+            faceId = faceId.toString(),
+            parentId = parents[faceId]?.toString(),
+            bbox = bboxByMember[faceId],
+        )
     }
     ctx.json(ClusterMemberPage(clusterId.toString(), memberIds.size, limit, offset, page))
 }
@@ -275,8 +292,37 @@ fun getClusterMembers(ctx: Context, schema: Schema) {
 )
 fun getClusterCentroid(ctx: Context, schema: Schema) {
     val clusterId = parseUuidOrThrow(ctx.pathParam("clusterId"), "clusterId")
-    val centroid = ClusterStateStore.forSchema(schema.name).getCentroid(clusterId)
-        ?: throw ErrorStatusException(404, "No centroid stored for cluster $clusterId.")
+    val store = ClusterStateStore.forSchema(schema.name)
+
+    /* Fast path: centroid already persisted. */
+    store.getCentroid(clusterId)?.let {
+        ctx.json(ClusterCentroidResponse(clusterId.toString(), it.toList()))
+        return
+    }
+
+    /* Backfill: compute from members' face embeddings, persist, and return.
+       Needed for clusters from older runs that predate centroid persistence. */
+    val memberIds = memberIdsOf(schema, clusterId)
+    if (memberIds.isEmpty()) {
+        throw ErrorStatusException(404, "Cluster $clusterId has no members; cannot compute centroid.")
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    val embField = schema["face"] as? Schema.Field<*, FloatVectorDescriptor>
+        ?: throw ErrorStatusException(500, "Schema has no 'face' embedding field configured.")
+
+    /* Postgres prepared-statement param cap; chunk the IN(...) the same way clustering does. */
+    val vectors: List<FloatArray> = memberIds.chunked(30_000)
+        .flatMap { batch -> embField.getReader().getAllForRetrievable(batch).toList() }
+        .map { it.vector.value }
+
+    if (vectors.isEmpty()) {
+        throw ErrorStatusException(404, "Cluster $clusterId has members but no face embeddings.")
+    }
+
+    val centroid = FaceClusteringService.computeMeanNormalized(vectors)
+    store.setCentroid(clusterId, centroid)
+    logger.info { "[ClusterCentroid] Backfilled centroid for cluster $clusterId from ${vectors.size} members." }
     ctx.json(ClusterCentroidResponse(clusterId.toString(), centroid.toList()))
 }
 
@@ -557,4 +603,180 @@ fun splitCluster(ctx: Context, schema: Schema) {
         movedMembers = toMove.size,
         message = "Split $srcClusterId — ${toMove.size} members moved.",
     ))
+}
+
+@OpenApi(
+    path = "/api/{schema}/clusters/stats/group-sizes",
+    methods = [HttpMethod.GET],
+    summary = "Histogram of how many distinct clusters appear together per segment.",
+    operationId = "getGroupSizeHistogram",
+    tags = ["Cluster"],
+    pathParams = [OpenApiParam("schema", type = String::class, required = true)],
+    responses = [OpenApiResponse("200", [OpenApiContent(GroupSizeHistogramResponse::class)])]
+)
+fun getGroupSizeHistogram(ctx: Context, schema: Schema) {
+    val reader = schema.connection.getRetrievableReader()
+
+    /* face -> cluster, for every FACE_DETECTION that has a cluster membership. */
+    val faceToCluster: Map<UUID, UUID> = reader.getConnections(
+        subjectIds = emptyList(),
+        predicates = listOf("memberOfCluster"),
+        objectIds = emptyList(),
+    ).associate { it.subjectId to it.objectId }
+
+    /* face -> parent segment; chunk to stay under the 65k param cap. */
+    val partOfPairs: List<Pair<UUID, UUID>> = faceToCluster.keys.chunked(30_000).flatMap { batch ->
+        reader.getConnections(
+            subjectIds = batch,
+            predicates = listOf("partOf"),
+            objectIds = emptyList(),
+        ).map { it.subjectId to it.objectId }.toList()
+    }
+
+    /* segment -> distinct cluster ids present. */
+    val segmentToClusters = mutableMapOf<UUID, MutableSet<UUID>>()
+    for ((faceId, segmentId) in partOfPairs) {
+        val clusterId = faceToCluster[faceId] ?: continue
+        segmentToClusters.computeIfAbsent(segmentId) { mutableSetOf() }.add(clusterId)
+    }
+
+    val histogram = segmentToClusters.values
+        .groupingBy { it.size }
+        .eachCount()
+        .toSortedMap()
+
+    val bins = histogram.map { (k, count) -> GroupSizeBin(k = k, segmentCount = count) }
+    val total = segmentToClusters.size
+
+    ctx.json(GroupSizeHistogramResponse(totalSegments = total, bins = bins))
+}
+
+@OpenApi(
+    path = "/api/{schema}/clusters/match",
+    methods = [HttpMethod.POST],
+    summary = "Server-side AND-intersection of cluster memberships, with optional spatial ordering.",
+    operationId = "matchClusters",
+    tags = ["Cluster"],
+    pathParams = [OpenApiParam("schema", type = String::class, required = true)],
+    requestBody = OpenApiRequestBody([OpenApiContent(ClusterMatchRequest::class)], required = true),
+    responses = [
+        OpenApiResponse("200", [OpenApiContent(ClusterMatchResponse::class)]),
+        OpenApiResponse("400", [OpenApiContent(ErrorStatus::class)]),
+    ]
+)
+fun matchClusters(ctx: Context, schema: Schema) {
+    val body = runCatching { ctx.bodyAsClass<ClusterMatchRequest>() }
+        .getOrElse { throw ErrorStatusException(400, "Invalid request body.") }
+
+    val include = body.include.map { parseUuidOrThrow(it, "include cluster") }.toSet()
+    val exclude = body.exclude.map { parseUuidOrThrow(it, "exclude cluster") }.toSet()
+    val spatialOrder = body.spatialOrder?.map { parseUuidOrThrow(it, "spatialOrder cluster") }
+    val axis = body.axis.lowercase().also {
+        require(it == "x" || it == "y") { "axis must be 'x' or 'y'." }
+    }
+    val limit = body.limit.coerceAtLeast(1)
+
+    if (include.isEmpty() && spatialOrder.isNullOrEmpty()) {
+        throw ErrorStatusException(400, "Must specify at least one include or spatialOrder cluster.")
+    }
+
+    val reader = schema.connection.getRetrievableReader()
+
+    /* All clusters we care about (membership + spatial). */
+    val allClusters = include + exclude + (spatialOrder?.toSet() ?: emptySet())
+
+    /* face -> cluster, but only for faces that are in any of the requested clusters. */
+    val faceToCluster: Map<UUID, UUID> = reader.getConnections(
+        subjectIds = emptyList(),
+        predicates = listOf("memberOfCluster"),
+        objectIds = allClusters.toList(),
+    ).associate { it.subjectId to it.objectId }
+
+    /* face -> parent segment. */
+    val partOfPairs: List<Pair<UUID, UUID>> = faceToCluster.keys.chunked(30_000).flatMap { batch ->
+        reader.getConnections(
+            subjectIds = batch,
+            predicates = listOf("partOf"),
+            objectIds = emptyList(),
+        ).map { it.subjectId to it.objectId }.toList()
+    }
+
+    /* segment -> map<cluster, list<face>>. */
+    val segmentClusterFaces = mutableMapOf<UUID, MutableMap<UUID, MutableList<UUID>>>()
+    for ((faceId, segmentId) in partOfPairs) {
+        val clusterId = faceToCluster[faceId] ?: continue
+        segmentClusterFaces
+            .computeIfAbsent(segmentId) { mutableMapOf() }
+            .computeIfAbsent(clusterId) { mutableListOf() }
+            .add(faceId)
+    }
+
+    /* Apply include/exclude filter. */
+    val survivingSegments = segmentClusterFaces.filter { (_, presentByCluster) ->
+        val present = presentByCluster.keys
+        include.all { it in present } && exclude.none { it in present }
+    }
+
+    /* If no spatial constraint, score = 1.0 for each survivor, sort by segment id (stable). */
+    if (spatialOrder.isNullOrEmpty()) {
+        val hits = survivingSegments.keys.sortedBy { it.toString() }.take(limit)
+            .map { ClusterMatchHit(segmentId = it.toString(), score = 1.0f) }
+        ctx.json(ClusterMatchResponse(total = survivingSegments.size, limit = limit, results = hits))
+        return
+    }
+
+    /* From here on, spatialOrder is guaranteed non-null and non-empty.
+       Bind to a non-null local so smart-cast doesn't get lost in inner lambdas. */
+    val order: List<UUID> = spatialOrder
+
+    /* Spatial constraint: need bboxes for every face that's in a spatialOrder cluster in a surviving segment. */
+    @Suppress("UNCHECKED_CAST")
+    val bboxField = schema["facebbox"] as? Schema.Field<*, FloatVectorDescriptor>
+        ?: throw ErrorStatusException(500, "Schema has no 'facebbox' field configured; cannot run spatial query.")
+
+    val spatialSet = order.toSet()
+    val facesNeeded: List<UUID> = survivingSegments.values
+        .flatMap { byCluster -> byCluster.filterKeys { it in spatialSet }.values.flatten() }
+        .distinct()
+
+    val bboxByFace: Map<UUID, FloatArray> = facesNeeded.chunked(30_000).flatMap { batch ->
+        bboxField.getReader().getAllForRetrievable(batch).toList()
+    }.mapNotNull { d -> d.retrievableId?.let { it to d.vector.value } }.toMap()
+
+    /* For each surviving segment, compute mean center along axis for each spatialOrder cluster. */
+    val coordIdx = if (axis == "x") intArrayOf(0, 2) else intArrayOf(1, 3) // [x1,x2] or [y1,y2]
+
+    data class Scored(val segmentId: UUID, val score: Float)
+    val scored = mutableListOf<Scored>()
+    for ((segmentId, byCluster) in survivingSegments) {
+        /* For each cluster in spatialOrder, mean center across this segment's faces. */
+        val centers = FloatArray(order.size)
+        var allPresent = true
+        for ((i, cid) in order.withIndex()) {
+            val facesOfCluster = byCluster[cid].orEmpty()
+            val xs = facesOfCluster.mapNotNull { bboxByFace[it] }.map { b ->
+                ((b[coordIdx[0]] + b[coordIdx[1]]) / 2f)
+            }
+            if (xs.isEmpty()) { allPresent = false; break }
+            centers[i] = xs.average().toFloat()
+        }
+        if (!allPresent) continue
+
+        /* Check monotonic ascending and accumulate margin. */
+        var totalMargin = 0f
+        var monotonic = true
+        for (i in 1 until centers.size) {
+            val margin = centers[i] - centers[i - 1]
+            if (margin <= 0f) { monotonic = false; break }
+            totalMargin += margin
+        }
+        if (!monotonic) continue
+        val score = totalMargin / (centers.size - 1).coerceAtLeast(1)
+        scored.add(Scored(segmentId, score))
+    }
+
+    val total = scored.size
+    val hits = scored.sortedByDescending { it.score }.take(limit)
+        .map { ClusterMatchHit(segmentId = it.segmentId.toString(), score = it.score) }
+    ctx.json(ClusterMatchResponse(total = total, limit = limit, results = hits))
 }
