@@ -5,6 +5,8 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.javalin.http.Context
 import io.javalin.http.bodyAsClass
 import io.javalin.openapi.*
+import org.vitrivr.engine.core.model.descriptor.struct.metadata.TemporalMetadataDescriptor
+import org.vitrivr.engine.core.model.descriptor.struct.metadata.source.FileSourceMetadataDescriptor
 import org.vitrivr.engine.core.model.descriptor.vector.FloatVectorDescriptor
 import org.vitrivr.engine.core.model.metamodel.Schema
 import org.vitrivr.engine.core.model.relationship.Relationship
@@ -46,6 +48,68 @@ private fun parentMapOf(schema: Schema, faceIds: Collection<UUID>): Map<UUID, UU
         predicates = listOf("partOf"),
         objectIds = emptyList(),
     ).associate { it.subjectId to it.objectId }
+}
+
+/** Bundle of frontend-display metadata for a SEGMENT hit. */
+private data class SegmentDisplayInfo(
+    val sourceId: UUID?,
+    val filePath: String?,
+    val startNs: Long?,
+    val endNs: Long?,
+)
+
+/**
+ * Each lookup is independent; missing fields just yield null in the result.
+ */
+private fun segmentDisplayInfoFor(
+    schema: Schema,
+    segmentIds: Collection<UUID>,
+): Map<UUID, SegmentDisplayInfo> {
+    if (segmentIds.isEmpty()) return emptyMap()
+    val reader = schema.connection.getRetrievableReader()
+
+    /* segment -> source (segment's partOf relation). */
+    val segToSource: Map<UUID, UUID> = segmentIds.chunked(30_000).flatMap { batch ->
+        reader.getConnections(
+            subjectIds = batch,
+            predicates = listOf("partOf"),
+            objectIds = emptyList(),
+        ).map { it.subjectId to it.objectId }.toList()
+    }.toMap()
+
+    /* source -> file.path, only when the schema has the field configured. */
+    @Suppress("UNCHECKED_CAST")
+    val fileField = schema["file"] as? Schema.Field<*, FileSourceMetadataDescriptor>
+    val sourceToPath: Map<UUID, String> = if (fileField != null) {
+        val sourceIds = segToSource.values.toSet().toList()
+        sourceIds.chunked(30_000).flatMap { batch ->
+            fileField.getReader().getAllForRetrievable(batch).toList()
+        }.mapNotNull { d -> d.retrievableId?.let { it to d.path.value } }.toMap()
+    } else {
+        emptyMap()
+    }
+
+    /* segment -> (start, end) nanoseconds, from the segment's own TemporalMetadata. */
+    @Suppress("UNCHECKED_CAST")
+    val timeField = schema["time"] as? Schema.Field<*, TemporalMetadataDescriptor>
+    val segToTime: Map<UUID, Pair<Long, Long>> = if (timeField != null) {
+        segmentIds.chunked(30_000).flatMap { batch ->
+            timeField.getReader().getAllForRetrievable(batch).toList()
+        }.mapNotNull { d -> d.retrievableId?.let { it to (d.start.value to d.end.value) } }.toMap()
+    } else {
+        emptyMap()
+    }
+
+    return segmentIds.associateWith { segId ->
+        val srcId = segToSource[segId]
+        val time = segToTime[segId]
+        SegmentDisplayInfo(
+            sourceId = srcId,
+            filePath = srcId?.let { sourceToPath[it] },
+            startNs = time?.first,
+            endNs = time?.second,
+        )
+    }
 }
 
 @OpenApi(
@@ -719,8 +783,19 @@ fun matchClusters(ctx: Context, schema: Schema) {
 
     /* If no spatial constraint, score = 1.0 for each survivor, sort by segment id (stable). */
     if (spatialOrder.isNullOrEmpty()) {
-        val hits = survivingSegments.keys.sortedBy { it.toString() }.take(limit)
-            .map { ClusterMatchHit(segmentId = it.toString(), score = 1.0f) }
+        val pageIds = survivingSegments.keys.sortedBy { it.toString() }.take(limit)
+        val info = segmentDisplayInfoFor(schema, pageIds)
+        val hits = pageIds.map { segId ->
+            val d = info[segId]
+            ClusterMatchHit(
+                segmentId = segId.toString(),
+                score = 1.0f,
+                sourceId = d?.sourceId?.toString(),
+                filePath = d?.filePath,
+                startNs = d?.startNs,
+                endNs = d?.endNs,
+            )
+        }
         ctx.json(ClusterMatchResponse(total = survivingSegments.size, limit = limit, results = hits))
         return
     }
@@ -776,7 +851,18 @@ fun matchClusters(ctx: Context, schema: Schema) {
     }
 
     val total = scored.size
-    val hits = scored.sortedByDescending { it.score }.take(limit)
-        .map { ClusterMatchHit(segmentId = it.segmentId.toString(), score = it.score) }
+    val topScored = scored.sortedByDescending { it.score }.take(limit)
+    val info = segmentDisplayInfoFor(schema, topScored.map { it.segmentId })
+    val hits = topScored.map {
+        val d = info[it.segmentId]
+        ClusterMatchHit(
+            segmentId = it.segmentId.toString(),
+            score = it.score,
+            sourceId = d?.sourceId?.toString(),
+            filePath = d?.filePath,
+            startNs = d?.startNs,
+            endNs = d?.endNs,
+        )
+    }
     ctx.json(ClusterMatchResponse(total = total, limit = limit, results = hits))
 }

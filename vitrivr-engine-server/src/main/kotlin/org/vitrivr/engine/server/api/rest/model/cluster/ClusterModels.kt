@@ -191,8 +191,8 @@ data class GroupSizeHistogramResponse(
 /**
  * Request body for `POST /clusters/match`.
  *
- * Server-side AND-intersection of cluster memberships, replacing the multi-query intersection
- * the frontend currently does. Returns exactly the segments where every cluster in [include]
+ * Server-side AND-intersection of cluster memberships.
+ * Returns exactly the segments where every cluster in [include]
  * has at least one member and none of the clusters in [exclude] do.
  *
  * Optional [spatialOrder] adds a left-to-right (or top-to-bottom) constraint: among the segments
@@ -213,6 +213,16 @@ data class ClusterMatchRequest(
 data class ClusterMatchHit(
     val segmentId: String,
     val score: Float,
+    /** Parent SOURCE retrievable id. Null if the segment has no source link. */
+    val sourceId: String? = null,
+    /** `file.path` descriptor of the parent SOURCE. Used by the frontend to build a video URL
+        and a stable dedupe key. Null when no FileSourceMetadata is available. */
+    val filePath: String? = null,
+    /** Segment start in nanoseconds (from the segment's `time` descriptor). Null when no
+        TemporalMetadata is configured or the segment has none. */
+    val startNs: Long? = null,
+    /** Segment end in nanoseconds. */
+    val endNs: Long? = null,
 )
 
 @Serializable
