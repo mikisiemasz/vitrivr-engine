@@ -11,3 +11,4 @@ org.vitrivr.engine.module.features.feature.external.implementations.emotions.Emo
 org.vitrivr.engine.module.features.feature.external.implementations.emotions.EmotionsSound
 org.vitrivr.engine.module.features.feature.external.implementations.asr.AutomaticSpeechRecognition
 org.vitrivr.engine.module.features.feature.external.implementations.face.FaceEmbedding
+org.vitrivr.engine.module.features.feature.external.implementations.face.FaceBoundingBox
