@@ -277,6 +277,29 @@ fun listClusters(ctx: Context, schema: Schema) {
     val total = sorted.size
     val page = sorted.drop(offset).take(limit)
 
+    /* Enrich exemplars with bboxes — only for the visible page, so we don't pay for clusters
+       the caller will never render. The vitrivr-web needs bboxes to draw a face overlay on the
+       parent thumbnail (parent segments often contain multiple faces). */
+    @Suppress("UNCHECKED_CAST")
+    val bboxField = schema["facebbox"] as? Schema.Field<*, FloatVectorDescriptor>
+    val pageWithBbox: List<ClusterGalleryItem> = if (bboxField != null) {
+        val pageExemplarIds: List<UUID> = page
+            .flatMap { it.exemplars.mapNotNull { e -> runCatching { UUID.fromString(e.faceId) }.getOrNull() } }
+            .distinct()
+        val bboxByFace: Map<UUID, List<Float>> = pageExemplarIds.chunked(30_000)
+            .flatMap { batch -> bboxField.getReader().getAllForRetrievable(batch).toList() }
+            .mapNotNull { d -> d.retrievableId?.let { it to d.vector.value.toList() } }
+            .toMap()
+        page.map { item ->
+            item.copy(
+                exemplars = item.exemplars.map { ex ->
+                    val faceUuid = runCatching { UUID.fromString(ex.faceId) }.getOrNull()
+                    ex.copy(bbox = faceUuid?.let { bboxByFace[it] })
+                }
+            )
+        }
+    } else page
+
     ctx.json(
         ClusterGalleryResponse(
             runId = runIdFilter?.toString() ?: "all",
@@ -284,7 +307,7 @@ fun listClusters(ctx: Context, schema: Schema) {
             totalClusters = total,
             limit = limit,
             offset = offset,
-            clusters = page,
+            clusters = pageWithBbox,
         )
     )
 }
@@ -713,6 +736,197 @@ fun getGroupSizeHistogram(ctx: Context, schema: Schema) {
     val total = segmentToClusters.size
 
     ctx.json(GroupSizeHistogramResponse(totalSegments = total, bins = bins))
+}
+
+@OpenApi(
+    path = "/api/{schema}/clusters/identify",
+    methods = [HttpMethod.POST],
+    summary = "Returns clusters whose centroids most resemble the supplied face embedding.",
+    operationId = "identifyCluster",
+    tags = ["Cluster"],
+    pathParams = [OpenApiParam("schema", type = String::class, required = true)],
+    requestBody = OpenApiRequestBody([OpenApiContent(ClusterIdentifyRequest::class)], required = true),
+    responses = [
+        OpenApiResponse("200", [OpenApiContent(ClusterIdentifyResponse::class)]),
+        OpenApiResponse("400", [OpenApiContent(ErrorStatus::class)]),
+    ]
+)
+fun identifyCluster(ctx: Context, schema: Schema) {
+    val body = runCatching { ctx.bodyAsClass<ClusterIdentifyRequest>() }
+        .getOrElse { throw ErrorStatusException(400, "Invalid request body.") }
+
+    if (body.embedding.isEmpty()) throw ErrorStatusException(400, "embedding must not be empty.")
+    if (body.topK < 1) throw ErrorStatusException(400, "topK must be >= 1.")
+
+    /* Renormalize defensively — centroids are stored normalized; cosine = dot product when both
+       are unit-length, otherwise the threshold has unclear semantics. */
+    val q = FloatArray(body.embedding.size) { body.embedding[it] }
+    val qNorm = run {
+        var s = 0.0
+        for (v in q) s += (v * v).toDouble()
+        kotlin.math.sqrt(s).toFloat()
+    }
+    if (qNorm <= 0f || !qNorm.isFinite()) {
+        throw ErrorStatusException(400, "embedding has zero or non-finite norm.")
+    }
+    for (i in q.indices) q[i] /= qNorm
+
+    val store = ClusterStateStore.forSchema(schema.name)
+    val centroids = store.allCentroids()
+    val labels = store.allLabels()
+
+    if (centroids.isEmpty()) {
+        ctx.json(ClusterIdentifyResponse(totalClusters = 0, matches = emptyList()))
+        return
+    }
+
+    val scored = centroids.mapNotNull { (clusterId, centroid) ->
+        if (centroid.size != q.size) return@mapNotNull null // skip dim mismatch
+        var dot = 0f
+        for (i in q.indices) dot += q[i] * centroid[i]
+        clusterId to dot
+    }
+
+    val matches = scored.asSequence()
+        .filter { it.second >= body.threshold }
+        .sortedByDescending { it.second }
+        .take(body.topK)
+        .map { (id, sim) ->
+            ClusterIdentifyMatch(
+                clusterId = id.toString(),
+                similarity = sim,
+                label = labels[id],
+            )
+        }
+        .toList()
+
+    ctx.json(ClusterIdentifyResponse(totalClusters = centroids.size, matches = matches))
+}
+
+@OpenApi(
+    path = "/api/{schema}/clusters/identify-batch",
+    methods = [HttpMethod.POST],
+    summary = "For every cluster, returns its best-matching candidate face above the threshold.",
+    operationId = "identifyClusterBatch",
+    tags = ["Cluster"],
+    pathParams = [OpenApiParam("schema", type = String::class, required = true)],
+    requestBody = OpenApiRequestBody([OpenApiContent(ClusterIdentifyBatchRequest::class)], required = true),
+    responses = [
+        OpenApiResponse("200", [OpenApiContent(ClusterIdentifyBatchResponse::class)]),
+        OpenApiResponse("400", [OpenApiContent(ErrorStatus::class)]),
+    ]
+)
+fun identifyClusterBatch(ctx: Context, schema: Schema) {
+    val body = runCatching { ctx.bodyAsClass<ClusterIdentifyBatchRequest>() }
+        .getOrElse { throw ErrorStatusException(400, "Invalid request body.") }
+
+    if (body.candidates.isEmpty()) {
+        throw ErrorStatusException(400, "candidates must not be empty.")
+    }
+
+    /* Normalize each candidate embedding once up front (cosine = dot when both unit-length). */
+    val candidates: List<Pair<String, FloatArray>> = body.candidates.map { c ->
+        if (c.name.isBlank()) throw ErrorStatusException(400, "candidate name must not be blank.")
+        if (c.embedding.isEmpty()) throw ErrorStatusException(400, "candidate '${c.name}' has empty embedding.")
+        val v = FloatArray(c.embedding.size) { c.embedding[it] }
+        var s = 0.0
+        for (x in v) s += (x * x).toDouble()
+        val n = kotlin.math.sqrt(s).toFloat()
+        if (n <= 0f || !n.isFinite()) {
+            throw ErrorStatusException(400, "candidate '${c.name}' has zero or non-finite norm.")
+        }
+        for (i in v.indices) v[i] /= n
+        c.name to v
+    }
+
+    val store = ClusterStateStore.forSchema(schema.name)
+    val centroids = store.allCentroids()
+    val labels = store.allLabels()
+
+    val assignments = mutableListOf<ClusterIdentifyAssignment>()
+    val unmatched = mutableListOf<UnmatchedClusterRow>()
+
+    for ((clusterId, centroid) in centroids) {
+        /* For each cluster: cosine vs every candidate, keep the winner above threshold. */
+        var bestName: String? = null
+        var bestSim = Float.NEGATIVE_INFINITY
+        for ((name, embedding) in candidates) {
+            if (embedding.size != centroid.size) continue
+            var dot = 0f
+            for (i in embedding.indices) dot += embedding[i] * centroid[i]
+            if (dot > bestSim) {
+                bestSim = dot
+                bestName = name
+            }
+        }
+        if (bestName != null && bestSim >= body.threshold) {
+            assignments += ClusterIdentifyAssignment(
+                clusterId = clusterId.toString(),
+                bestName = bestName,
+                similarity = bestSim,
+                existingLabel = labels[clusterId],
+            )
+        } else {
+            unmatched += UnmatchedClusterRow(
+                clusterId = clusterId.toString(),
+                label = labels[clusterId],
+            )
+        }
+    }
+
+    assignments.sortByDescending { it.similarity }
+    /* Stable but human-friendly ordering for the unmatched list: labelled first, then by id. */
+    unmatched.sortWith(compareBy({ it.label.isNullOrBlank() }, { it.label ?: "" }, { it.clusterId }))
+
+    ctx.json(ClusterIdentifyBatchResponse(
+        totalClusters = centroids.size,
+        assignments = assignments,
+        unmatched = unmatched,
+    ))
+}
+
+@OpenApi(
+    path = "/api/{schema}/clusters/{clusterId}",
+    methods = [HttpMethod.DELETE],
+    summary = "Deletes a cluster: detaches its members/exemplars, drops the retrievable, and removes its centroid/label.",
+    operationId = "deleteCluster",
+    tags = ["Cluster"],
+    pathParams = [
+        OpenApiParam("schema", type = String::class, required = true),
+        OpenApiParam("clusterId", type = String::class, required = true),
+    ],
+    responses = [
+        OpenApiResponse("204"),
+        OpenApiResponse("404", [OpenApiContent(ErrorStatus::class)]),
+    ]
+)
+fun deleteCluster(ctx: Context, schema: Schema) {
+    val clusterId = parseUuidOrThrow(ctx.pathParam("clusterId"), "clusterId")
+    val reader = schema.connection.getRetrievableReader()
+    val writer = schema.connection.getRetrievableWriter()
+
+    val clusterRetrievable = reader.get(clusterId)
+        ?: throw ErrorStatusException(404, "Cluster $clusterId not found.")
+
+    /* Detach all member + exemplar edges so the underlying FACE_DETECTIONs are released back to
+       the 'unclustered' pool. The detections themselves are valuable independently and stay. */
+    val memberIds = memberIdsOf(schema, clusterId)
+    if (memberIds.isNotEmpty()) {
+        writer.disconnectAll(memberIds.map { Relationship.ById(it, "memberOfCluster", clusterId, transient = false) })
+    }
+    val exemplarIds = exemplarIdsOf(schema, clusterId)
+    if (exemplarIds.isNotEmpty()) {
+        writer.disconnectAll(exemplarIds.map { Relationship.ById(it, "exemplarOfCluster", clusterId, transient = false) })
+    }
+
+    /* Drop the FACE_CLUSTER retrievable itself. */
+    writer.delete(clusterRetrievable)
+
+    /* Drop the persisted centroid + label so it doesn't reappear in identify/listing. */
+    ClusterStateStore.forSchema(schema.name).remove(clusterId)
+
+    logger.info { "[Cluster] Deleted cluster $clusterId (released ${memberIds.size} members, ${exemplarIds.size} exemplars)." }
+    ctx.status(204)
 }
 
 @OpenApi(

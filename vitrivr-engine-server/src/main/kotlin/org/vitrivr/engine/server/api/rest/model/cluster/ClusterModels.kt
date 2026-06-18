@@ -27,6 +27,7 @@ data class ClusterRunSummary(
 data class ClusterExemplar(
     val faceId: String,
     val parentId: String? = null,
+    val bbox: List<Float>? = null,
 )
 
 /**
@@ -230,4 +231,88 @@ data class ClusterMatchResponse(
     val total: Int,
     val limit: Int,
     val results: List<ClusterMatchHit>,
+)
+
+/**
+ * Request body for `POST /clusters/identify`.
+ *
+ * Given a face embedding, returns the clusters whose centroids are most
+ * similar to it. The vitrivr-web uses this to turn a manual photo upload into a *label* on an
+ * existing cluster, so the resulting gallery entry can take the fast `/clusters/match` path
+ * instead of the per-face ANN fallback.
+ *
+ * Both the query and the centroids are assumed L2-normalized; cosine similarity reduces to a
+ * dot product. The query is renormalized server-side as a safety measure.
+ */
+@Serializable
+data class ClusterIdentifyRequest(
+    val embedding: List<Float>,
+    /** Minimum cosine similarity (inclusive). */
+    val threshold: Float = 0.5f,
+    /** Max number of matches to return after thresholding, ranked by similarity descending. */
+    val topK: Int = 5,
+)
+
+@Serializable
+data class ClusterIdentifyMatch(
+    val clusterId: String,
+    val similarity: Float,
+    /** Existing curator label, if any. */
+    val label: String? = null,
+)
+
+@Serializable
+data class ClusterIdentifyResponse(
+    /** Total number of clusters scored (i.e. centroid count), regardless of threshold. */
+    val totalClusters: Int,
+    val matches: List<ClusterIdentifyMatch>,
+)
+
+/**
+ * One person's averaged face embedding, paired with the name to assign on match.
+ * Used by the batch endpoint where a folder of photos has been collapsed to a single embedding.
+ */
+@Serializable
+data class ClusterIdentifyCandidate(
+    val name: String,
+    val embedding: List<Float>,
+)
+
+/**
+ * Request body for `POST /clusters/identify-batch`.
+ *
+ * Inverts the [ClusterIdentifyRequest] direction: instead of "given one face, which clusters
+ * resemble it?", asks "given these N labelled candidate faces, what's each cluster's best-matching
+ * candidate?" Used for the upload curation flow
+ */
+@Serializable
+data class ClusterIdentifyBatchRequest(
+    val candidates: List<ClusterIdentifyCandidate>,
+    /** Min cosine similarity for a cluster to be considered assigned. */
+    val threshold: Float = 0.5f,
+)
+
+/** A cluster that matched at least one candidate above threshold. */
+@Serializable
+data class ClusterIdentifyAssignment(
+    val clusterId: String,
+    /** Winning candidate name (the one with the highest cosine to this cluster's centroid). */
+    val bestName: String,
+    val similarity: Float,
+    /** Curator label currently set on the cluster, if any. May differ from [bestName]. */
+    val existingLabel: String? = null,
+)
+
+/** A cluster whose centroid does not resemble any candidate above the threshold. */
+@Serializable
+data class UnmatchedClusterRow(
+    val clusterId: String,
+    val label: String? = null,
+)
+
+@Serializable
+data class ClusterIdentifyBatchResponse(
+    val totalClusters: Int,
+    val assignments: List<ClusterIdentifyAssignment>,
+    val unmatched: List<UnmatchedClusterRow>,
 )

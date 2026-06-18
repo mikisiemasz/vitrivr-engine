@@ -59,8 +59,11 @@ fun configureApiRoutes(config: ApiConfig, manager: SchemaManager, executor: Exec
                         get("{clusterId}/co-occurrences") { ctx -> getClusterCoOccurrences(ctx, schema) }
                         get("stats/group-sizes") { ctx -> getGroupSizeHistogram(ctx, schema) }
                         post("match") { ctx -> matchClusters(ctx, schema) }
+                        post("identify") { ctx -> identifyCluster(ctx, schema) }
+                        post("identify-batch") { ctx -> identifyClusterBatch(ctx, schema) }
                         patch("{clusterId}/label") { ctx -> patchClusterLabel(ctx, schema) }
                         post("{clusterId}/split") { ctx -> splitCluster(ctx, schema) }
+                        delete("{clusterId}") { ctx -> deleteCluster(ctx, schema) }
                     }
                 }
 
