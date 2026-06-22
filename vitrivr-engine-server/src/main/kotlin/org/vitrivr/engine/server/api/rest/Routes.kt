@@ -57,6 +57,7 @@ fun configureApiRoutes(config: ApiConfig, manager: SchemaManager, executor: Exec
                         get("{clusterId}/centroid") { ctx -> getClusterCentroid(ctx, schema) }
                         get("{clusterId}/segments") { ctx -> getClusterSegments(ctx, schema) }
                         get("{clusterId}/co-occurrences") { ctx -> getClusterCoOccurrences(ctx, schema) }
+                        get("{clusterId}/timeline") { ctx -> getClusterTimeline(ctx, schema) }
                         get("stats/group-sizes") { ctx -> getGroupSizeHistogram(ctx, schema) }
                         post("match") { ctx -> matchClusters(ctx, schema) }
                         post("identify") { ctx -> identifyCluster(ctx, schema) }

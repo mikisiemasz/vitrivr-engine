@@ -452,6 +452,74 @@ fun getClusterSegments(ctx: Context, schema: Schema) {
 }
 
 @OpenApi(
+    path = "/api/{schema}/clusters/{clusterId}/timeline",
+    methods = [HttpMethod.GET],
+    summary = "Returns, per video, the segments in which this cluster's members appear (timestamped).",
+    operationId = "getClusterTimeline",
+    tags = ["Cluster"],
+    pathParams = [
+        OpenApiParam("schema", type = String::class, required = true),
+        OpenApiParam("clusterId", type = String::class, required = true),
+    ],
+    responses = [
+        OpenApiResponse("200", [OpenApiContent(ClusterTimelineResponse::class)]),
+        OpenApiResponse("404", [OpenApiContent(ErrorStatus::class)]),
+    ]
+)
+fun getClusterTimeline(ctx: Context, schema: Schema) {
+    val clusterId = parseUuidOrThrow(ctx.pathParam("clusterId"), "clusterId")
+    val reader = schema.connection.getRetrievableReader()
+
+    val memberIds = memberIdsOf(schema, clusterId)
+    if (memberIds.isEmpty() && reader.get(clusterId) == null) {
+        throw ErrorStatusException(404, "Cluster $clusterId not found.")
+    }
+    if (memberIds.isEmpty()) {
+        ctx.json(ClusterTimelineResponse(clusterId.toString(), emptyList()))
+        return
+    }
+
+    /* face -> segment, then collapse to segment -> detection count. */
+    val faceToSegment = parentMapOf(schema, memberIds)
+    val detectionCountBySegment: Map<UUID, Int> = faceToSegment.values.groupingBy { it }.eachCount()
+
+    /* Resolve source id + time range for every unique segment in one bulk pass. */
+    val segmentIds = detectionCountBySegment.keys.toList()
+    val info = segmentDisplayInfoFor(schema, segmentIds)
+
+    /* Group by parent source, dropping segments that lack a source link or time descriptor —
+       those can't be placed on a timeline. */
+    data class Bucket(var filePath: String?, val segs: MutableList<ClusterTimelineSegment>)
+    val bySource = mutableMapOf<UUID, Bucket>()
+    for (segId in segmentIds) {
+        val d = info[segId] ?: continue
+        val src = d.sourceId ?: continue
+        val s = d.startNs ?: continue
+        val e = d.endNs ?: continue
+        val bucket = bySource.getOrPut(src) { Bucket(d.filePath, mutableListOf()) }
+        if (bucket.filePath == null) bucket.filePath = d.filePath
+        bucket.segs += ClusterTimelineSegment(
+            segmentId = segId.toString(),
+            startNs = s,
+            endNs = e,
+            detectionCount = detectionCountBySegment[segId] ?: 0,
+        )
+    }
+
+    val videos = bySource.map { (srcId, bucket) ->
+        val sorted = bucket.segs.sortedBy { it.startNs }
+        ClusterTimelineVideo(
+            sourceId = srcId.toString(),
+            filePath = bucket.filePath,
+            lastAppearanceNs = sorted.maxOf { it.endNs },
+            segments = sorted,
+        )
+    }.sortedByDescending { it.segments.size }
+
+    ctx.json(ClusterTimelineResponse(clusterId.toString(), videos))
+}
+
+@OpenApi(
     path = "/api/{schema}/clusters/{clusterId}/co-occurrences",
     methods = [HttpMethod.GET],
     summary = "Returns clusters that share parent segments with the given cluster, ranked by shared count.",

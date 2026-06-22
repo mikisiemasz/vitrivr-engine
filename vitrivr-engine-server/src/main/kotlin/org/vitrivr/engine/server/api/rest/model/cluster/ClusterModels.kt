@@ -310,6 +310,29 @@ data class UnmatchedClusterRow(
     val label: String? = null,
 )
 
+/** One segment in a cluster's video timeline. Nanosecond offsets within the source file. */
+@Serializable
+data class ClusterTimelineSegment(
+    val segmentId: String,
+    val startNs: Long,
+    val endNs: Long,
+    val detectionCount: Int,
+)
+
+@Serializable
+data class ClusterTimelineVideo(
+    val sourceId: String,
+    val filePath: String? = null,
+    val lastAppearanceNs: Long,
+    val segments: List<ClusterTimelineSegment>,
+)
+
+@Serializable
+data class ClusterTimelineResponse(
+    val clusterId: String,
+    val videos: List<ClusterTimelineVideo>,
+)
+
 @Serializable
 data class ClusterIdentifyBatchResponse(
     val totalClusters: Int,
