@@ -12,6 +12,7 @@ import org.vitrivr.engine.core.model.descriptor.struct.metadata.MediaDimensionsD
 import org.vitrivr.engine.core.model.descriptor.struct.metadata.Rectangle2DMetadataDescriptor
 import org.vitrivr.engine.core.model.descriptor.struct.metadata.ShotBoundaryDescriptor
 import org.vitrivr.engine.core.model.descriptor.struct.metadata.TemporalMetadataDescriptor
+import org.vitrivr.engine.core.model.descriptor.struct.identity.TrackMetaDescriptor
 import org.vitrivr.engine.core.model.descriptor.struct.metadata.source.FileSourceMetadataDescriptor
 import org.vitrivr.engine.core.model.descriptor.struct.metadata.source.VideoSourceMetadataDescriptor
 import org.vitrivr.engine.core.model.descriptor.vector.*
@@ -94,6 +95,7 @@ class PgVectorConnectionProvider: AbstractConnectionProvider() {
         this.register(Rectangle2DMetadataDescriptor::class, StructDescriptorProvider)
         this.register(MediaDimensionsDescriptor::class, StructDescriptorProvider)
         this.register(AnyMapStructDescriptor::class, StructDescriptorProvider)
+        this.register(TrackMetaDescriptor::class, StructDescriptorProvider)
     }
 
     /**

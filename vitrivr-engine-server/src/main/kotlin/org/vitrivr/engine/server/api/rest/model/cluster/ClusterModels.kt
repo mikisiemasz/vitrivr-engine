@@ -4,11 +4,16 @@ import kotlinx.serialization.Serializable
 
 /**
  * Summary of a FACE_CLUSTER_RUN retrievable returned by list / trigger endpoints.
+ *
+ * [target] is "detections" (per-frame clustering) or "tracks" (per-shot identity merge). The frontend uses
+ * this to pick member rendering for the gallery — track-based clusters show track cards, detection-based
+ * clusters show face cards.
  */
 @Serializable
 data class ClusterRunSummary(
     val runId: String,
     val algorithm: String,
+    val target: String = "detections",
     val embeddingField: String,
     val minClusterSize: Int,
     val minSamples: Int,
@@ -22,24 +27,39 @@ data class ClusterRunSummary(
     val status: String,
 )
 
-/** Exemplar face referenced by a cluster card, with its parent segment for thumbnailing. */
+/**
+ * Exemplar face referenced by a cluster card, with its parent segment for thumbnailing.
+ *
+ * For track-clusters, [faceId] holds the *representative* FACE_DETECTION id (one per exemplar
+ * track) so the UI can render a thumbnail with the same bbox-on-segment-thumbnail logic as
+ * detection-clusters. [trackId] is the originating FACE_TRACK id when applicable, otherwise null;
+ * the UI uses it if it ever wants to expand into the track's detail view.
+ */
 @Serializable
 data class ClusterExemplar(
     val faceId: String,
     val parentId: String? = null,
     val bbox: List<Float>? = null,
+    val trackId: String? = null,
 )
 
 /**
  * A single cluster card in the gallery view.
  *
- * [exemplars] contains up to N centroid-nearest face detections; the UI maps their
- * `parentId` to a segment thumbnail.
+ * [exemplars] contains up to N centroid-nearest members; the UI maps their `parentId` to a segment thumbnail.
+ * For detection-target clusters, members are FACE_DETECTION ids (parentId = segment). For track-target
+ * clusters, members are FACE_TRACK ids, and the exemplars' faceId field carries the *representative
+ * FACE_DETECTION* of each track (the track's centroid-nearest detection), so the frontend can render
+ * track clusters with the same bbox-on-segment-thumbnail logic without branching.
+ *
+ * [memberType] is "FACE_DETECTION" or "FACE_TRACK" — the frontend uses this to decide whether the cluster
+ * detail view should expand into per-track timelines or stay at the per-detection grid.
  */
 @Serializable
 data class ClusterGalleryItem(
     val clusterId: String,
     val memberCount: Int,
+    val memberType: String = "FACE_DETECTION",
     val exemplars: List<ClusterExemplar>,
     /** Optional label set by the curator via PATCH /clusters/{id}/label. */
     val label: String? = null,

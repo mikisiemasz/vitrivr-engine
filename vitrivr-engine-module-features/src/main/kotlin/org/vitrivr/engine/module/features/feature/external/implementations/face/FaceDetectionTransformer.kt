@@ -47,6 +47,10 @@ class FaceDetectionTransformer : OperatorFactory {
     override fun newOperator(name: String, inputs: Map<String, Operator<out Retrievable>>, context: Context): Transformer {
         val embeddingFieldName = context[name, "embeddingField"] ?: "face"
         val bboxFieldName = context[name, "bboxField"] ?: "facebbox"
+        /* Resolution order for the Python descriptor server host:
+           1. Operator-level "host" parameter in video-ingest.json (explicit override)
+           2. The embedding field's "host" parameter in config-schema.json (default)
+           3. HOST_PARAMETER_DEFAULT */
         val host = context[name, HOST_PARAMETER_NAME]
             ?: context.schema[embeddingFieldName]?.parameters?.get(HOST_PARAMETER_NAME)
             ?: HOST_PARAMETER_DEFAULT
@@ -82,8 +86,19 @@ class FaceDetectionTransformer : OperatorFactory {
         }
 
         /**
+         * Endpoint path on the Python descriptor server that matches the embedding field's
+         * configured model (e.g. FaceEmbeddingArcface → `/extract/face_embedding`,
+         * FaceEmbeddingFacenet → `/extract/face_embedding_facenet`). Falls back to the ArcFace
+         * path so existing schemas without an analyser instance still work.
+         */
+        private val endpointPath: String by lazy {
+            (embeddingField?.analyser as? FaceEmbeddingBase)?.endpointPath
+                ?: "/extract/face_embedding"
+        }
+
+        /**
          * Lazily resolved bounding-box field. Null when the field is not configured in the schema —
-         * in that case bbox storage is silently skipped.
+         * in that case bbox storage is silently skipped (backwards-compatible).
          */
         @Suppress("UNCHECKED_CAST")
         private val bboxField: Schema.Field<ImageContent, FloatVectorDescriptor>? by lazy {
@@ -102,7 +117,7 @@ class FaceDetectionTransformer : OperatorFactory {
                 }
 
                 val detections = try {
-                    FaceEmbedding.analyse(imageContent, host)
+                    FaceEmbeddingBase.analyse(imageContent, host, endpointPath)
                 } catch (e: Throwable) {
                     logger.error(e) { "Face detection call failed for retrievable ${retrievable.id}" }
                     emptyList()

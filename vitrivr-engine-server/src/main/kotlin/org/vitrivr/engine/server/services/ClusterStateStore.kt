@@ -35,6 +35,9 @@ data class ClusterStateFile(
     val centroids: MutableMap<String, List<Float>> = mutableMapOf(),
 )
 
+/* TODO: delete after re-extraction once all schemas have the clusterCentroid / clusterLabel
+   descriptor fields populated. The live path is ClusterStore (which writes to descriptors);
+   this sidecar is only kept around as a read-only fallback for runs created before the migration. */
 class ClusterStateStore(private val path: Path) {
 
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }

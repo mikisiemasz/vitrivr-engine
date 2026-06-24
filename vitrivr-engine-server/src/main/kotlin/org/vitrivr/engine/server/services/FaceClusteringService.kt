@@ -23,29 +23,57 @@ import java.util.*
 private val logger: KLogger = KotlinLogging.logger {}
 
 /**
+ * What kind of retrievable the clustering operates on.
+ *
+ * - [DETECTIONS]: classic per-frame clustering. Members of the resulting FACE_CLUSTERs are FACE_DETECTION ids.
+ * - [TRACKS]: cluster by the [trackEmbedding] mean of each FACE_TRACK. Members are FACE_TRACK ids. This is the
+ *   layered identity-merge step: tracking denoises within shots, then clustering merges identities across shots.
+ *
+ * Centroids and labels are stored the same way for both targets; only the input set and the member type differ.
+ */
+enum class ClusteringTarget { DETECTIONS, TRACKS }
+
+/**
  * Parameters for one face clustering run.
  *
- * @property embeddingFieldName  Schema field that holds the face embeddings (default: "face").
+ * @property target              Whether the run clusters per-frame detections or per-shot tracks. Controls
+ *                               input retrievable type and embedding field selection.
+ * @property embeddingFieldName  Schema field that holds the embeddings. Defaults are target-aware:
+ *                               "face" for [ClusteringTarget.DETECTIONS], "trackEmbedding" for [ClusteringTarget.TRACKS].
  * @property minClusterSize      HDBSCAN min_cluster_size.
  * @property minSamples          HDBSCAN min_samples.
  * @property pythonServerUrl     Base URL of the Python descriptor server.
- * @property exemplarCount       How many centroid-nearest detections to store as cluster exemplars.
+ * @property exemplarCount       How many centroid-nearest members to store as cluster exemplars.
  * @property labelCarryThreshold Cosine similarity above which a new cluster's centroid is considered
  *                               the same identity as a previously labelled cluster and inherits its label.
  */
 data class ClusteringParams(
-    val embeddingFieldName: String = "face",
+    val target: ClusteringTarget = ClusteringTarget.DETECTIONS,
+    val embeddingFieldName: String? = null,
     val minClusterSize: Int = 5,
     val minSamples: Int = 3,
     val pythonServerUrl: String = HOST_PARAMETER_DEFAULT,
     val exemplarCount: Int = 5,
     val labelCarryThreshold: Float = 0.6f,
-)
+) {
+    /** Resolves the embedding field name, falling back to the target's default if unspecified. */
+    fun effectiveEmbeddingFieldName(): String = embeddingFieldName ?: when (target) {
+        ClusteringTarget.DETECTIONS -> "face"
+        ClusteringTarget.TRACKS -> "trackEmbedding"
+    }
+
+    /** Source retrievable type fed to the clusterer. */
+    fun inputRetrievableType(): String = when (target) {
+        ClusteringTarget.DETECTIONS -> "FACE_DETECTION"
+        ClusteringTarget.TRACKS -> "FACE_TRACK"
+    }
+}
 
 /** Summary of a completed or in-progress clustering run. */
 data class ClusterRunInfo(
     val runId: UUID,
     val algorithm: String,
+    val target: ClusteringTarget,
     val embeddingField: String,
     val minClusterSize: Int,
     val minSamples: Int,
@@ -84,12 +112,13 @@ private data class ClusterResponse(
  *    (persisted as `exemplarOfCluster` relationships).
  * 5. Carries labels forward from previously labelled clusters by nearest-centroid cosine match.
  *
- * Side-channel state (centroids + labels) is stored via [ClusterStateStore] because we don't
- * want centroids polluting the `face` embedding field's ANN index.
+ * Per-cluster centroids + labels are persisted via [ClusterStore] into the `clusterCentroid`
+ * and `clusterLabel` descriptor fields. A separate field (not `face`) is used so centroids
+ * don't pollute the face ANN index.
  */
 class FaceClusteringService(
     private val schema: Schema,
-    private val state: ClusterStateStore = ClusterStateStore.forSchema(schema.name),
+    private val state: ClusterStore = ClusterStore.forSchema(schema),
 ) {
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -99,14 +128,16 @@ class FaceClusteringService(
         val startedAt = Instant.now().toString()
 
         val reader = schema.connection.getRetrievableReader()
-        val detections = reader.getAll("FACE_DETECTION").toList()
-        logger.info { "[Clustering] Found ${detections.size} FACE_DETECTION retrievables." }
-        if (detections.isEmpty()) return emptyRun(params, startedAt, "NO_DETECTIONS")
+        val inputType = params.inputRetrievableType()
+        val detections = reader.getAll(inputType).toList()
+        logger.info { "[Clustering] Found ${detections.size} $inputType retrievables (target=${params.target})." }
+        if (detections.isEmpty()) return emptyRun(params, startedAt, "NO_INPUTS")
 
+        val embeddingFieldName = params.effectiveEmbeddingFieldName()
         @Suppress("UNCHECKED_CAST")
-        val embField = schema[params.embeddingFieldName] as? Schema.Field<*, FloatVectorDescriptor>
+        val embField = schema[embeddingFieldName] as? Schema.Field<*, FloatVectorDescriptor>
             ?: run {
-                logger.error { "[Clustering] Embedding field '${params.embeddingFieldName}' not found." }
+                logger.error { "[Clustering] Embedding field '$embeddingFieldName' not found." }
                 return emptyRun(params, startedAt, "FIELD_NOT_FOUND")
             }
 
@@ -198,7 +229,8 @@ class FaceClusteringService(
         return ClusterRunInfo(
             runId = runId,
             algorithm = "HDBSCAN",
-            embeddingField = params.embeddingFieldName,
+            target = params.target,
+            embeddingField = embeddingFieldName,
             minClusterSize = params.minClusterSize,
             minSamples = params.minSamples,
             numInputFaces = embeddings.size,
@@ -249,7 +281,8 @@ class FaceClusteringService(
         ClusterRunInfo(
             runId = UUID.randomUUID(),
             algorithm = "HDBSCAN",
-            embeddingField = params.embeddingFieldName,
+            target = params.target,
+            embeddingField = params.effectiveEmbeddingFieldName(),
             minClusterSize = params.minClusterSize,
             minSamples = params.minSamples,
             numInputFaces = 0,

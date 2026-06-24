@@ -52,6 +52,7 @@ fun configureApiRoutes(config: ApiConfig, manager: SchemaManager, executor: Exec
                         get { ctx -> listClusters(ctx, schema) }
                         get("runs") { ctx -> listClusterRuns(ctx, schema) }
                         post("run") { ctx -> triggerClustering(ctx, schema) }
+                        delete("runs/{runId}") { ctx -> deleteClusterRun(ctx, schema) }
                         post("merge") { ctx -> mergeClusters(ctx, schema) }
                         get("{clusterId}/members") { ctx -> getClusterMembers(ctx, schema) }
                         get("{clusterId}/centroid") { ctx -> getClusterCentroid(ctx, schema) }
@@ -65,6 +66,11 @@ fun configureApiRoutes(config: ApiConfig, manager: SchemaManager, executor: Exec
                         patch("{clusterId}/label") { ctx -> patchClusterLabel(ctx, schema) }
                         post("{clusterId}/split") { ctx -> splitCluster(ctx, schema) }
                         delete("{clusterId}") { ctx -> deleteCluster(ctx, schema) }
+                    }
+                    path("tracks") {
+                        get("runs") { ctx -> listTrackRuns(ctx, schema) }
+                        post("run") { ctx -> triggerTracking(ctx, schema) }
+                        delete("runs/{runId}") { ctx -> deleteTrackRun(ctx, schema) }
                     }
                 }
 
