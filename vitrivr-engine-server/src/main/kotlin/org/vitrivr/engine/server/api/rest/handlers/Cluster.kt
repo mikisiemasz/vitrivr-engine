@@ -17,8 +17,9 @@ import org.vitrivr.engine.module.features.feature.external.ExternalAnalyser.Comp
 import org.vitrivr.engine.server.api.rest.model.ErrorStatus
 import org.vitrivr.engine.server.api.rest.model.ErrorStatusException
 import org.vitrivr.engine.server.api.rest.model.cluster.*
-import org.vitrivr.engine.server.services.ClusterStateStore
+import org.vitrivr.engine.server.services.ClusterStore
 import org.vitrivr.engine.server.services.ClusteringParams
+import org.vitrivr.engine.server.services.ClusteringTarget
 import org.vitrivr.engine.server.services.FaceClusteringService
 import java.util.*
 
@@ -48,6 +49,82 @@ private fun parentMapOf(schema: Schema, faceIds: Collection<UUID>): Map<UUID, UU
         predicates = listOf("partOf"),
         objectIds = emptyList(),
     ).associate { it.subjectId to it.objectId }
+}
+
+/**
+ * Returns one FACE_DETECTION id per input FACE_TRACK id, via the `partOfTrack` relationship.
+ * Picks any face per track (first one returned by the bulk query). Tracks that have no member
+ * detections are silently dropped.
+ *
+ * Cheap unifier used by every handler that needs to render or score track-cluster exemplars.
+ * Could be upgraded to "closest to track centroid" later — requires loading embeddings.
+ */
+private fun representativeFaceByTrack(schema: Schema, trackIds: Collection<UUID>): Map<UUID, UUID> {
+    if (trackIds.isEmpty()) return emptyMap()
+    val pairs = trackIds.chunked(30_000).flatMap { batch ->
+        schema.connection.getRetrievableReader().getConnections(
+            subjectIds = emptyList(),
+            predicates = listOf("partOfTrack"),
+            objectIds = batch,
+        ).map { it.subjectId to it.objectId }.toList()
+    }
+    /* group by track; pick first face seen per track. */
+    return pairs.groupBy { it.second }.mapValues { (_, list) -> list.first().first }
+}
+
+/**
+ * Returns the underlying FACE_DETECTION ids for a cluster.
+ * - Detection clusters: direct 'memberOfCluster' members.
+ * - Track clusters: members are FACE_TRACKs; expanded via `partOfTrack` to the faces inside.
+ *
+ * Single unifier so every downstream walk (segments, timeline, match, co-occurrences) only needs
+ * to handle face ids; the cluster-type branch lives here.
+ */
+private fun detectionIdsOfCluster(schema: Schema, clusterId: UUID): List<UUID> {
+    val reader = schema.connection.getRetrievableReader()
+    val memberIds = memberIdsOf(schema, clusterId)
+    if (memberIds.isEmpty()) return emptyList()
+    val memberType = reader.get(memberIds.first())?.type ?: "FACE_DETECTION"
+    if (memberType != "FACE_TRACK") return memberIds
+    /* Track cluster: expand each track to its member faces via partOfTrack (face → track edges). */
+    return memberIds.chunked(30_000).flatMap { batch ->
+        reader.getConnections(
+            subjectIds = emptyList(),
+            predicates = listOf("partOfTrack"),
+            objectIds = batch,
+        ).map { it.subjectId }.toList()
+    }
+}
+
+/**
+ * Set of FACE_CLUSTER ids whose members are of the given retrievable type ("FACE_DETECTION" or
+ * "FACE_TRACK"). Used to scope identify / centroid scans to one clustering kind so detection-clusters
+ * and track-clusters aren't compared in the same ranking.
+ *
+ * One pass over all memberOfCluster edges + one id-scan of the target type. A cluster is classified
+ * by the type of any one of its members (uniform within a cluster).
+ */
+private fun clusterIdsByTarget(schema: Schema, memberType: String): Set<UUID> {
+    val reader = schema.connection.getRetrievableReader()
+    val typeIds = reader.getAll(memberType).map { it.id }.toHashSet()
+    if (typeIds.isEmpty()) return emptySet()
+    return reader.getConnections(
+        subjectIds = emptyList(),
+        predicates = listOf("memberOfCluster"),
+        objectIds = emptyList(),
+    ).groupBy { it.objectId }
+        .filterValues { rels -> rels.first().subjectId in typeIds }
+        .keys
+}
+
+/** Parses a `target` query param into a member retrievable type, or null when absent/"all". */
+private fun parseTargetParam(raw: String?): String? = raw?.lowercase()?.let {
+    when (it) {
+        "detections", "detection" -> "FACE_DETECTION"
+        "tracks", "track" -> "FACE_TRACK"
+        "all", "" -> null
+        else -> throw ErrorStatusException(400, "Invalid target '$it'; expected 'detections', 'tracks', or 'all'.")
+    }
 }
 
 /** Bundle of frontend-display metadata for a SEGMENT hit. */
@@ -124,10 +201,31 @@ private fun segmentDisplayInfoFor(
 fun listClusterRuns(ctx: Context, schema: Schema) {
     val reader = schema.connection.getRetrievableReader()
     val runs = reader.getAll("FACE_CLUSTER_RUN").map { run ->
+        /* Infer target by walking the run → one cluster → one member → member.type. Avoids needing a
+           dedicated descriptor on the run retrievable to record what kind of clustering it was. */
+        val (target, embeddingField) = run {
+            val anyCluster = reader.getConnections(
+                subjectIds = emptyList(),
+                predicates = listOf("producedByRun"),
+                objectIds = listOf(run.id),
+            ).map { it.subjectId }.firstOrNull()
+            val anyMemberType = anyCluster?.let { c ->
+                reader.getConnections(
+                    subjectIds = emptyList(),
+                    predicates = listOf("memberOfCluster"),
+                    objectIds = listOf(c),
+                ).map { it.subjectId }.firstOrNull()?.let { reader.get(it)?.type }
+            }
+            when (anyMemberType) {
+                "FACE_TRACK" -> "tracks" to "trackEmbedding"
+                else -> "detections" to "face"
+            }
+        }
         ClusterRunSummary(
             runId = run.id.toString(),
             algorithm = "HDBSCAN",
-            embeddingField = "face",
+            target = target,
+            embeddingField = embeddingField,
             minClusterSize = -1,
             minSamples = -1,
             numInputFaces = -1,
@@ -163,12 +261,21 @@ fun listClusterRuns(ctx: Context, schema: Schema) {
     ]
 )
 fun triggerClustering(ctx: Context, schema: Schema) {
-    val embeddingFieldName = ctx.queryParam("embeddingField") ?: "face"
+    val target = when (ctx.queryParam("target")?.lowercase()) {
+        "tracks", "track" -> ClusteringTarget.TRACKS
+        "detections", "detection", null -> ClusteringTarget.DETECTIONS
+        else -> throw ErrorStatusException(400, "Invalid target '${ctx.queryParam("target")}'; expected 'detections' or 'tracks'.")
+    }
+    /* Embedding field defaults are target-aware (face vs trackEmbedding) and resolved inside ClusteringParams. */
+    val embeddingFieldName = ctx.queryParam("embeddingField")
+    /* Host resolution still keys off the underlying face model's "host" param — tracking and detection both go to
+       the same Python server, so the face field's host is the right default in both modes. */
     val resolvedHost = ctx.queryParam("pythonServer")
-        ?: schema[embeddingFieldName]?.parameters?.get(HOST_PARAMETER_NAME)
+        ?: schema["face"]?.parameters?.get(HOST_PARAMETER_NAME)
         ?: HOST_PARAMETER_DEFAULT
 
     val params = ClusteringParams(
+        target = target,
         embeddingFieldName = embeddingFieldName,
         minClusterSize = ctx.queryParam("minClusterSize")?.toIntOrNull() ?: 5,
         minSamples = ctx.queryParam("minSamples")?.toIntOrNull() ?: 3,
@@ -188,6 +295,7 @@ fun triggerClustering(ctx: Context, schema: Schema) {
         ClusterRunSummary(
             runId = result.runId.toString(),
             algorithm = result.algorithm,
+            target = result.target.name.lowercase(),
             embeddingField = result.embeddingField,
             minClusterSize = result.minClusterSize,
             minSamples = result.minSamples,
@@ -212,6 +320,7 @@ fun triggerClustering(ctx: Context, schema: Schema) {
     pathParams = [OpenApiParam("schema", type = String::class, required = true)],
     queryParams = [
         OpenApiParam("runId", type = String::class),
+        OpenApiParam("target", type = String::class, description = "detections | tracks | all (default: all)"),
         OpenApiParam("limit", type = Int::class),
         OpenApiParam("offset", type = Int::class),
         OpenApiParam("minMembers", type = Int::class),
@@ -229,6 +338,16 @@ fun listClusters(ctx: Context, schema: Schema) {
     val sort = ctx.queryParam("sort") ?: "members"
     val onlyLabelled = ctx.queryParam("onlyLabelled")?.toBoolean() ?: false
     val onlyUnlabelled = ctx.queryParam("onlyUnlabelled")?.toBoolean() ?: false
+    /* Optional target filter: restrict the gallery to detection-clusters (FACE_DETECTION members) or
+       track-clusters (FACE_TRACK members). Omit / pass "all" to see everything (default). */
+    val targetFilter: String? = ctx.queryParam("target")?.lowercase()?.let {
+        when (it) {
+            "detections", "detection" -> "FACE_DETECTION"
+            "tracks", "track" -> "FACE_TRACK"
+            "all", "" -> null
+            else -> throw ErrorStatusException(400, "Invalid target '$it'; expected 'detections', 'tracks', or 'all'.")
+        }
+    }
 
     val reader = schema.connection.getRetrievableReader()
 
@@ -242,7 +361,7 @@ fun listClusters(ctx: Context, schema: Schema) {
         reader.getAll("FACE_CLUSTER").map { it.id }.toList()
     }
 
-    val labels = ClusterStateStore.forSchema(schema.name).allLabels()
+    val labels = ClusterStore.forSchema(schema).allLabels()
 
     val items = clusterIds.mapNotNull { clusterId ->
         val memberIds = memberIdsOf(schema, clusterId)
@@ -252,20 +371,37 @@ fun listClusters(ctx: Context, schema: Schema) {
         if (onlyLabelled && label == null) return@mapNotNull null
         if (onlyUnlabelled && label != null) return@mapNotNull null
 
-        val exemplarIds = exemplarIdsOf(schema, clusterId).ifEmpty { memberIds.take(3) }
-        val parents = parentMapOf(schema, memberIds)
-        val exemplars = exemplarIds.map {
-            ClusterExemplar(faceId = it.toString(), parentId = parents[it]?.toString())
-        }
-        val segmentCount = parents.values.toSet().size
+        /* Determine member type from any one member; uniform within a cluster. */
+        val memberType = memberIds.firstOrNull()?.let { reader.get(it)?.type } ?: "FACE_DETECTION"
+        if (targetFilter != null && memberType != targetFilter) return@mapNotNull null
 
-        ClusterGalleryItem(
-            clusterId = clusterId.toString(),
-            memberCount = memberIds.size,
-            exemplars = exemplars,
-            label = label,
-            segmentCount = segmentCount,
-        )
+        val exemplarIds = exemplarIdsOf(schema, clusterId).ifEmpty { memberIds.take(3) }
+
+        if (memberType == "FACE_TRACK") {
+            /* Track cluster: expand all member tracks to their face detections to compute segmentCount.
+               Exemplars stay as track ids here — they get resolved to representative faces in the
+               page-enrichment block below, where we bulk-fetch parent + bbox for the visible page. */
+            val faceIds = detectionIdsOfCluster(schema, clusterId)
+            val parentsAcrossTracks = parentMapOf(schema, faceIds)
+            ClusterGalleryItem(
+                clusterId = clusterId.toString(),
+                memberCount = memberIds.size,
+                memberType = memberType,
+                exemplars = exemplarIds.map { ClusterExemplar(faceId = it.toString(), trackId = it.toString()) },
+                label = label,
+                segmentCount = parentsAcrossTracks.values.toSet().size,
+            )
+        } else {
+            val parents = parentMapOf(schema, memberIds)
+            ClusterGalleryItem(
+                clusterId = clusterId.toString(),
+                memberCount = memberIds.size,
+                memberType = memberType,
+                exemplars = exemplarIds.map { ClusterExemplar(faceId = it.toString(), parentId = parents[it]?.toString()) },
+                label = label,
+                segmentCount = parents.values.toSet().size,
+            )
+        }
     }
 
     val sorted = when (sort) {
@@ -277,20 +413,47 @@ fun listClusters(ctx: Context, schema: Schema) {
     val total = sorted.size
     val page = sorted.drop(offset).take(limit)
 
-    /* Enrich exemplars with bboxes — only for the visible page, so we don't pay for clusters
-       the caller will never render. The vitrivr-web needs bboxes to draw a face overlay on the
-       parent thumbnail (parent segments often contain multiple faces). */
+    /* Enrich exemplars for the visible page only.
+       - Detection clusters: bbox lookup against 'facebbox' keyed by exemplar face id.
+       - Track clusters: first resolve every exemplar track to a representative FACE_DETECTION
+         (any face in the track — could be upgraded to closest-to-centroid later), then the same
+         parent + bbox lookups apply. After this step both kinds present uniform exemplars to the
+         frontend: faceId points at a renderable detection, parentId at its segment, bbox at the
+         face crop in that segment's frame. */
     @Suppress("UNCHECKED_CAST")
     val bboxField = schema["facebbox"] as? Schema.Field<*, FloatVectorDescriptor>
+
+    val pageTrackExemplarIds: List<UUID> = page
+        .filter { it.memberType == "FACE_TRACK" }
+        .flatMap { it.exemplars.mapNotNull { e -> runCatching { UUID.fromString(e.faceId) }.getOrNull() } }
+        .distinct()
+    val repFaceByTrack = representativeFaceByTrack(schema, pageTrackExemplarIds)
+    val repFaceParents = parentMapOf(schema, repFaceByTrack.values)
+
+    val pageWithExemplars = page.map { item ->
+        if (item.memberType != "FACE_TRACK") item
+        else item.copy(
+            exemplars = item.exemplars.map { ex ->
+                val trackUuid = runCatching { UUID.fromString(ex.faceId) }.getOrNull()
+                val rep = trackUuid?.let { repFaceByTrack[it] }
+                if (rep == null) ex.copy(trackId = ex.faceId) else ex.copy(
+                    faceId = rep.toString(),
+                    parentId = repFaceParents[rep]?.toString(),
+                    trackId = ex.faceId,
+                )
+            }
+        )
+    }
+
     val pageWithBbox: List<ClusterGalleryItem> = if (bboxField != null) {
-        val pageExemplarIds: List<UUID> = page
+        val pageExemplarFaceIds: List<UUID> = pageWithExemplars
             .flatMap { it.exemplars.mapNotNull { e -> runCatching { UUID.fromString(e.faceId) }.getOrNull() } }
             .distinct()
-        val bboxByFace: Map<UUID, List<Float>> = pageExemplarIds.chunked(30_000)
+        val bboxByFace: Map<UUID, List<Float>> = pageExemplarFaceIds.chunked(30_000)
             .flatMap { batch -> bboxField.getReader().getAllForRetrievable(batch).toList() }
             .mapNotNull { d -> d.retrievableId?.let { it to d.vector.value.toList() } }
             .toMap()
-        page.map { item ->
+        pageWithExemplars.map { item ->
             item.copy(
                 exemplars = item.exemplars.map { ex ->
                     val faceUuid = runCatching { UUID.fromString(ex.faceId) }.getOrNull()
@@ -298,7 +461,7 @@ fun listClusters(ctx: Context, schema: Schema) {
                 }
             )
         }
-    } else page
+    } else pageWithExemplars
 
     ctx.json(
         ClusterGalleryResponse(
@@ -333,11 +496,14 @@ fun getClusterMembers(ctx: Context, schema: Schema) {
     val limit = ctx.queryParam("limit")?.toIntOrNull()?.coerceAtLeast(1) ?: 100
     val offset = ctx.queryParam("offset")?.toIntOrNull()?.coerceAtLeast(0) ?: 0
 
-    val memberIds = memberIdsOf(schema, clusterId)
-    if (memberIds.isEmpty() && schema.connection.getRetrievableReader().get(clusterId) == null) {
+    if (schema.connection.getRetrievableReader().get(clusterId) == null) {
         throw ErrorStatusException(404, "Cluster $clusterId not found.")
     }
 
+    /* For track-clusters, expand directly to the underlying face detections so the detail view
+       can render the same bbox-on-segment-thumbnail grid as detection-clusters. The track structure
+       above them is still preserved in the DB (and surfaced via getClusterTimeline). */
+    val memberIds = detectionIdsOfCluster(schema, clusterId)
     val parents = parentMapOf(schema, memberIds)
     val pageIds = memberIds.drop(offset).take(limit)
 
@@ -379,24 +545,28 @@ fun getClusterMembers(ctx: Context, schema: Schema) {
 )
 fun getClusterCentroid(ctx: Context, schema: Schema) {
     val clusterId = parseUuidOrThrow(ctx.pathParam("clusterId"), "clusterId")
-    val store = ClusterStateStore.forSchema(schema.name)
+    val store = ClusterStore.forSchema(schema)
 
-    /* Fast path: centroid already persisted. */
+    /* Fast path: centroid already persisted (descriptor or legacy sidecar). */
     store.getCentroid(clusterId)?.let {
         ctx.json(ClusterCentroidResponse(clusterId.toString(), it.toList()))
         return
     }
 
-    /* Backfill: compute from members' face embeddings, persist, and return.
-       Needed for clusters from older runs that predate centroid persistence. */
+    /* Backfill: compute from members' embeddings, persist, and return.
+       Needed for clusters from older runs that predate centroid persistence. The embedding field
+       depends on cluster target: face for detection-clusters, trackEmbedding for track-clusters. */
     val memberIds = memberIdsOf(schema, clusterId)
     if (memberIds.isEmpty()) {
         throw ErrorStatusException(404, "Cluster $clusterId has no members; cannot compute centroid.")
     }
+    val reader = schema.connection.getRetrievableReader()
+    val memberType = reader.get(memberIds.first())?.type ?: "FACE_DETECTION"
+    val embFieldName = if (memberType == "FACE_TRACK") "trackEmbedding" else "face"
 
     @Suppress("UNCHECKED_CAST")
-    val embField = schema["face"] as? Schema.Field<*, FloatVectorDescriptor>
-        ?: throw ErrorStatusException(500, "Schema has no 'face' embedding field configured.")
+    val embField = schema[embFieldName] as? Schema.Field<*, FloatVectorDescriptor>
+        ?: throw ErrorStatusException(500, "Schema has no '$embFieldName' embedding field configured.")
 
     /* Postgres prepared-statement param cap; chunk the IN(...) the same way clustering does. */
     val vectors: List<FloatArray> = memberIds.chunked(30_000)
@@ -434,12 +604,13 @@ fun getClusterSegments(ctx: Context, schema: Schema) {
     val limit = ctx.queryParam("limit")?.toIntOrNull()?.coerceAtLeast(1) ?: 50
     val offset = ctx.queryParam("offset")?.toIntOrNull()?.coerceAtLeast(0) ?: 0
 
-    val memberIds = memberIdsOf(schema, clusterId)
-    if (memberIds.isEmpty() && schema.connection.getRetrievableReader().get(clusterId) == null) {
+    if (schema.connection.getRetrievableReader().get(clusterId) == null) {
         throw ErrorStatusException(404, "Cluster $clusterId not found.")
     }
 
-    val parents = parentMapOf(schema, memberIds)
+    /* Use the helper so segment aggregation works the same for both cluster targets. */
+    val faceIds = detectionIdsOfCluster(schema, clusterId)
+    val parents = parentMapOf(schema, faceIds)
     val grouped = parents.values
         .groupingBy { it }
         .eachCount()
@@ -470,17 +641,18 @@ fun getClusterTimeline(ctx: Context, schema: Schema) {
     val clusterId = parseUuidOrThrow(ctx.pathParam("clusterId"), "clusterId")
     val reader = schema.connection.getRetrievableReader()
 
-    val memberIds = memberIdsOf(schema, clusterId)
-    if (memberIds.isEmpty() && reader.get(clusterId) == null) {
+    if (reader.get(clusterId) == null) {
         throw ErrorStatusException(404, "Cluster $clusterId not found.")
     }
-    if (memberIds.isEmpty()) {
+    /* Helper handles both cluster targets; downstream stays face-level. */
+    val faceIds = detectionIdsOfCluster(schema, clusterId)
+    if (faceIds.isEmpty()) {
         ctx.json(ClusterTimelineResponse(clusterId.toString(), emptyList()))
         return
     }
 
     /* face -> segment, then collapse to segment -> detection count. */
-    val faceToSegment = parentMapOf(schema, memberIds)
+    val faceToSegment = parentMapOf(schema, faceIds)
     val detectionCountBySegment: Map<UUID, Int> = faceToSegment.values.groupingBy { it }.eachCount()
 
     /* Resolve source id + time range for every unique segment in one bulk pass. */
@@ -532,6 +704,7 @@ fun getClusterTimeline(ctx: Context, schema: Schema) {
     queryParams = [
         OpenApiParam("limit", type = Int::class),
         OpenApiParam("minShared", type = Int::class, description = "Drop partners with fewer than N shared segments (default: 1)"),
+        OpenApiParam("target", type = String::class, description = "detections | tracks — limits partners to clusters of this kind. Defaults to the same kind as the queried cluster."),
     ],
     responses = [
         OpenApiResponse("200", [OpenApiContent(CoOccurrenceResponse::class)]),
@@ -545,36 +718,73 @@ fun getClusterCoOccurrences(ctx: Context, schema: Schema) {
 
     val reader = schema.connection.getRetrievableReader()
 
-    val myMembers = memberIdsOf(schema, clusterId)
-    if (myMembers.isEmpty() && reader.get(clusterId) == null) {
+    val ownMemberIds = memberIdsOf(schema, clusterId)
+    if (ownMemberIds.isEmpty() && reader.get(clusterId) == null) {
         throw ErrorStatusException(404, "Cluster $clusterId not found.")
     }
-    val mySegments: Set<UUID> = parentMapOf(schema, myMembers).values.toSet()
+    val ownMemberType = ownMemberIds.firstOrNull()?.let { reader.get(it)?.type } ?: "FACE_DETECTION"
+
+    /* Default partner-target matches the queried cluster's own kind. Cross-kind co-occurrences
+       (a track cluster paired with a detection cluster) would be semantically odd, so opt-in only. */
+    val partnerTarget: String = ctx.queryParam("target")?.lowercase()?.let {
+        when (it) {
+            "detections", "detection" -> "FACE_DETECTION"
+            "tracks", "track" -> "FACE_TRACK"
+            else -> throw ErrorStatusException(400, "Invalid target '$it'; expected 'detections' or 'tracks'.")
+        }
+    } ?: ownMemberType
+
+    /* Expand own cluster to face detections — handles both targets uniformly. */
+    val myFaceIds = detectionIdsOfCluster(schema, clusterId)
+    val mySegments: Set<UUID> = parentMapOf(schema, myFaceIds).values.toSet()
     if (mySegments.isEmpty()) {
         ctx.json(CoOccurrenceResponse(clusterId.toString(), 0, emptyList()))
         return
     }
 
-    /* All FACE_DETECTION members in those segments, mapped back to their cluster (if any). */
+    /* All face detections appearing in those segments, with their parent segments. */
     val faceParentMap = reader.getConnections(
         subjectIds = emptyList(),
         predicates = listOf("partOf"),
         objectIds = mySegments,
     ).associate { it.subjectId to it.objectId } // face -> segment
 
+    /* Walk from face → cluster-membership. Path depends on partnerTarget:
+       - detections: face → memberOfCluster (direct)
+       - tracks:     face → partOfTrack → memberOfCluster (track's cluster) */
+    val faceToCandidateClusters: List<Pair<UUID, UUID>> = if (partnerTarget == "FACE_DETECTION") {
+        reader.getConnections(
+            subjectIds = faceParentMap.keys,
+            predicates = listOf("memberOfCluster"),
+            objectIds = emptyList(),
+        ).map { it.subjectId to it.objectId }.toList()
+    } else {
+        /* face → track */
+        val faceToTrack = reader.getConnections(
+            subjectIds = faceParentMap.keys,
+            predicates = listOf("partOfTrack"),
+            objectIds = emptyList(),
+        ).map { it.subjectId to it.objectId }.toList()
+        val trackIds = faceToTrack.map { it.second }.distinct()
+        /* track → cluster, chunked. */
+        val trackToCluster: Map<UUID, UUID> = trackIds.chunked(30_000).flatMap { batch ->
+            reader.getConnections(
+                subjectIds = batch,
+                predicates = listOf("memberOfCluster"),
+                objectIds = emptyList(),
+            ).map { it.subjectId to it.objectId }.toList()
+        }.toMap()
+        faceToTrack.mapNotNull { (face, track) -> trackToCluster[track]?.let { face to it } }
+    }
+
     val coClusterCounts = mutableMapOf<UUID, MutableSet<UUID>>() // otherCluster -> segments shared with `me`
-    reader.getConnections(
-        subjectIds = faceParentMap.keys,
-        predicates = listOf("memberOfCluster"),
-        objectIds = emptyList(),
-    ).forEach { rel ->
-        val other = rel.objectId
-        if (other == clusterId) return@forEach
-        val seg = faceParentMap[rel.subjectId] ?: return@forEach
+    for ((face, other) in faceToCandidateClusters) {
+        if (other == clusterId) continue
+        val seg = faceParentMap[face] ?: continue
         coClusterCounts.getOrPut(other) { mutableSetOf() }.add(seg)
     }
 
-    val labels = ClusterStateStore.forSchema(schema.name).allLabels()
+    val labels = ClusterStore.forSchema(schema).allLabels()
     val ranked = coClusterCounts
         .map { (id, segs) -> id to segs.size }
         .filter { it.second >= minShared }
@@ -617,7 +827,7 @@ fun patchClusterLabel(ctx: Context, schema: Schema) {
     if (schema.connection.getRetrievableReader().get(clusterId) == null) {
         throw ErrorStatusException(404, "Cluster $clusterId not found.")
     }
-    ClusterStateStore.forSchema(schema.name).setLabel(clusterId, body.label?.trim()?.takeIf { it.isNotEmpty() })
+    ClusterStore.forSchema(schema).setLabel(clusterId, body.label?.trim()?.takeIf { it.isNotEmpty() })
     ctx.status(204)
 }
 
@@ -643,7 +853,7 @@ fun mergeClusters(ctx: Context, schema: Schema) {
 
     val reader = schema.connection.getRetrievableReader()
     val writer = schema.connection.getRetrievableWriter()
-    val state = ClusterStateStore.forSchema(schema.name)
+    val state = ClusterStore.forSchema(schema)
 
     /* Inherit label if not explicitly given. */
     val labels = state.allLabels()
@@ -718,7 +928,7 @@ fun splitCluster(ctx: Context, schema: Schema) {
     val faceIds = body.faceIds.map { parseUuidOrThrow(it, "faceId") }
     val reader = schema.connection.getRetrievableReader()
     val writer = schema.connection.getRetrievableWriter()
-    val state = ClusterStateStore.forSchema(schema.name)
+    val state = ClusterStore.forSchema(schema)
 
     val srcMembers = memberIdsOf(schema, srcClusterId).toSet()
     if (srcMembers.isEmpty() && reader.get(srcClusterId) == null) {
@@ -767,17 +977,44 @@ fun splitCluster(ctx: Context, schema: Schema) {
     operationId = "getGroupSizeHistogram",
     tags = ["Cluster"],
     pathParams = [OpenApiParam("schema", type = String::class, required = true)],
+    queryParams = [
+        OpenApiParam("target", type = String::class, description = "detections | tracks (default: detections) — restricts the histogram to one kind of cluster."),
+    ],
     responses = [OpenApiResponse("200", [OpenApiContent(GroupSizeHistogramResponse::class)])]
 )
 fun getGroupSizeHistogram(ctx: Context, schema: Schema) {
     val reader = schema.connection.getRetrievableReader()
+    val targetType = when (ctx.queryParam("target")?.lowercase()) {
+        "tracks", "track" -> "FACE_TRACK"
+        "detections", "detection", null, "" -> "FACE_DETECTION"
+        else -> throw ErrorStatusException(400, "Invalid target '${ctx.queryParam("target")}'; expected 'detections' or 'tracks'.")
+    }
 
-    /* face -> cluster, for every FACE_DETECTION that has a cluster membership. */
-    val faceToCluster: Map<UUID, UUID> = reader.getConnections(
-        subjectIds = emptyList(),
-        predicates = listOf("memberOfCluster"),
-        objectIds = emptyList(),
-    ).associate { it.subjectId to it.objectId }
+    /* face -> cluster.
+       - detections: direct face → memberOfCluster
+       - tracks:     face → partOfTrack → memberOfCluster (the track's cluster) */
+    val faceToCluster: Map<UUID, UUID> = if (targetType == "FACE_DETECTION") {
+        reader.getConnections(
+            subjectIds = emptyList(),
+            predicates = listOf("memberOfCluster"),
+            objectIds = emptyList(),
+        ).associate { it.subjectId to it.objectId }
+    } else {
+        val faceToTrack = reader.getConnections(
+            subjectIds = emptyList(),
+            predicates = listOf("partOfTrack"),
+            objectIds = emptyList(),
+        ).map { it.subjectId to it.objectId }.toList()
+        val trackIds = faceToTrack.map { it.second }.distinct()
+        val trackToCluster: Map<UUID, UUID> = trackIds.chunked(30_000).flatMap { batch ->
+            reader.getConnections(
+                subjectIds = batch,
+                predicates = listOf("memberOfCluster"),
+                objectIds = emptyList(),
+            ).map { it.subjectId to it.objectId }.toList()
+        }.toMap()
+        faceToTrack.mapNotNull { (face, track) -> trackToCluster[track]?.let { face to it } }.toMap()
+    }
 
     /* face -> parent segment; chunk to stay under the 65k param cap. */
     val partOfPairs: List<Pair<UUID, UUID>> = faceToCluster.keys.chunked(30_000).flatMap { batch ->
@@ -813,6 +1050,7 @@ fun getGroupSizeHistogram(ctx: Context, schema: Schema) {
     operationId = "identifyCluster",
     tags = ["Cluster"],
     pathParams = [OpenApiParam("schema", type = String::class, required = true)],
+    queryParams = [OpenApiParam("target", type = String::class, description = "detections | tracks | all (default: all) — restrict scoring to one cluster kind.")],
     requestBody = OpenApiRequestBody([OpenApiContent(ClusterIdentifyRequest::class)], required = true),
     responses = [
         OpenApiResponse("200", [OpenApiContent(ClusterIdentifyResponse::class)]),
@@ -825,6 +1063,7 @@ fun identifyCluster(ctx: Context, schema: Schema) {
 
     if (body.embedding.isEmpty()) throw ErrorStatusException(400, "embedding must not be empty.")
     if (body.topK < 1) throw ErrorStatusException(400, "topK must be >= 1.")
+    val targetType = parseTargetParam(ctx.queryParam("target"))
 
     /* Renormalize defensively — centroids are stored normalized; cosine = dot product when both
        are unit-length, otherwise the threshold has unclear semantics. */
@@ -839,9 +1078,12 @@ fun identifyCluster(ctx: Context, schema: Schema) {
     }
     for (i in q.indices) q[i] /= qNorm
 
-    val store = ClusterStateStore.forSchema(schema.name)
-    val centroids = store.allCentroids()
+    val store = ClusterStore.forSchema(schema)
     val labels = store.allLabels()
+    val centroids = store.allCentroids().let { all ->
+        if (targetType == null) all
+        else clusterIdsByTarget(schema, targetType).let { allowed -> all.filterKeys { it in allowed } }
+    }
 
     if (centroids.isEmpty()) {
         ctx.json(ClusterIdentifyResponse(totalClusters = 0, matches = emptyList()))
@@ -878,6 +1120,7 @@ fun identifyCluster(ctx: Context, schema: Schema) {
     operationId = "identifyClusterBatch",
     tags = ["Cluster"],
     pathParams = [OpenApiParam("schema", type = String::class, required = true)],
+    queryParams = [OpenApiParam("target", type = String::class, description = "detections | tracks | all (default: all) — restrict scoring to one cluster kind.")],
     requestBody = OpenApiRequestBody([OpenApiContent(ClusterIdentifyBatchRequest::class)], required = true),
     responses = [
         OpenApiResponse("200", [OpenApiContent(ClusterIdentifyBatchResponse::class)]),
@@ -891,6 +1134,7 @@ fun identifyClusterBatch(ctx: Context, schema: Schema) {
     if (body.candidates.isEmpty()) {
         throw ErrorStatusException(400, "candidates must not be empty.")
     }
+    val targetType = parseTargetParam(ctx.queryParam("target"))
 
     /* Normalize each candidate embedding once up front (cosine = dot when both unit-length). */
     val candidates: List<Pair<String, FloatArray>> = body.candidates.map { c ->
@@ -907,9 +1151,12 @@ fun identifyClusterBatch(ctx: Context, schema: Schema) {
         c.name to v
     }
 
-    val store = ClusterStateStore.forSchema(schema.name)
-    val centroids = store.allCentroids()
+    val store = ClusterStore.forSchema(schema)
     val labels = store.allLabels()
+    val centroids = store.allCentroids().let { all ->
+        if (targetType == null) all
+        else clusterIdsByTarget(schema, targetType).let { allowed -> all.filterKeys { it in allowed } }
+    }
 
     val assignments = mutableListOf<ClusterIdentifyAssignment>()
     val unmatched = mutableListOf<UnmatchedClusterRow>()
@@ -991,9 +1238,67 @@ fun deleteCluster(ctx: Context, schema: Schema) {
     writer.delete(clusterRetrievable)
 
     /* Drop the persisted centroid + label so it doesn't reappear in identify/listing. */
-    ClusterStateStore.forSchema(schema.name).remove(clusterId)
+    ClusterStore.forSchema(schema).remove(clusterId)
 
     logger.info { "[Cluster] Deleted cluster $clusterId (released ${memberIds.size} members, ${exemplarIds.size} exemplars)." }
+    ctx.status(204)
+}
+
+@OpenApi(
+    path = "/api/{schema}/clusters/runs/{runId}",
+    methods = [HttpMethod.DELETE],
+    summary = "Deletes a FACE_CLUSTER_RUN and every FACE_CLUSTER it produced. " +
+              "Member retrievables (FACE_DETECTION or FACE_TRACK) are kept; only their cluster memberships are dropped.",
+    operationId = "deleteClusterRun",
+    tags = ["Cluster"],
+    pathParams = [
+        OpenApiParam("schema", type = String::class, required = true),
+        OpenApiParam("runId", type = String::class, required = true),
+    ],
+    responses = [
+        OpenApiResponse("204"),
+        OpenApiResponse("404", [OpenApiContent(ErrorStatus::class)]),
+    ]
+)
+fun deleteClusterRun(ctx: Context, schema: Schema) {
+    val runId = parseUuidOrThrow(ctx.pathParam("runId"), "runId")
+    val reader = schema.connection.getRetrievableReader()
+    val writer = schema.connection.getRetrievableWriter()
+    val runRetrievable = reader.get(runId)
+        ?: throw ErrorStatusException(404, "Cluster run $runId not found.")
+
+    /* Find every FACE_CLUSTER produced by this run and run the same detach-then-delete sequence
+       deleteCluster does for each. Member retrievables (detections/tracks) themselves are preserved. */
+    val clusterIds: List<UUID> = reader.getConnections(
+        subjectIds = emptyList(),
+        predicates = listOf("producedByRun"),
+        objectIds = listOf(runId),
+    ).map { it.subjectId }.toList()
+
+    val store = ClusterStore.forSchema(schema)
+    var detachedMembers = 0
+    var detachedExemplars = 0
+    for (cid in clusterIds) {
+        val cluster = reader.get(cid) ?: continue
+        val memberIds = memberIdsOf(schema, cid)
+        if (memberIds.isNotEmpty()) {
+            writer.disconnectAll(memberIds.map { Relationship.ById(it, "memberOfCluster", cid, transient = false) })
+            detachedMembers += memberIds.size
+        }
+        val exemplarIds = exemplarIdsOf(schema, cid)
+        if (exemplarIds.isNotEmpty()) {
+            writer.disconnectAll(exemplarIds.map { Relationship.ById(it, "exemplarOfCluster", cid, transient = false) })
+            detachedExemplars += exemplarIds.size
+        }
+        writer.disconnectAll(listOf(Relationship.ById(cid, "producedByRun", runId, transient = false)))
+        writer.delete(cluster)
+        store.remove(cid)
+    }
+
+    writer.delete(runRetrievable)
+    logger.info {
+        "[Cluster] Deleted run $runId (${clusterIds.size} clusters, $detachedMembers members, $detachedExemplars exemplars detached)."
+    }
     ctx.status(204)
 }
 
@@ -1031,12 +1336,16 @@ fun matchClusters(ctx: Context, schema: Schema) {
     /* All clusters we care about (membership + spatial). */
     val allClusters = include + exclude + (spatialOrder?.toSet() ?: emptySet())
 
-    /* face -> cluster, but only for faces that are in any of the requested clusters. */
-    val faceToCluster: Map<UUID, UUID> = reader.getConnections(
-        subjectIds = emptyList(),
-        predicates = listOf("memberOfCluster"),
-        objectIds = allClusters.toList(),
-    ).associate { it.subjectId to it.objectId }
+    /* face -> cluster, but only for faces in the requested clusters. Uses detectionIdsOfCluster
+       so both detection-clusters and track-clusters resolve to face ids uniformly. A face that's
+       transitively in multiple requested clusters keeps the *first* one we see — same behavior
+       as the previous single-Map associate. */
+    val faceToCluster: MutableMap<UUID, UUID> = mutableMapOf()
+    for (cid in allClusters) {
+        for (face in detectionIdsOfCluster(schema, cid)) {
+            faceToCluster.putIfAbsent(face, cid)
+        }
+    }
 
     /* face -> parent segment. */
     val partOfPairs: List<Pair<UUID, UUID>> = faceToCluster.keys.chunked(30_000).flatMap { batch ->

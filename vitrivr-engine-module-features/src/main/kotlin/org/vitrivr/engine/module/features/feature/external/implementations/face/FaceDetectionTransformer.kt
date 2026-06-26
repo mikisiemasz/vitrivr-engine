@@ -82,6 +82,17 @@ class FaceDetectionTransformer : OperatorFactory {
         }
 
         /**
+         * Endpoint path on the Python descriptor server that matches the embedding field's
+         * configured model (e.g. FaceEmbeddingArcface → `/extract/face_embedding`,
+         * FaceEmbeddingFacenet → `/extract/face_embedding_facenet`). Falls back to the ArcFace
+         * path so existing schemas without an analyser instance still work.
+         */
+        private val endpointPath: String by lazy {
+            (embeddingField?.analyser as? FaceEmbeddingBase)?.endpointPath
+                ?: "/extract/face_embedding"
+        }
+
+        /**
          * Lazily resolved bounding-box field. Null when the field is not configured in the schema —
          * in that case bbox storage is silently skipped.
          */
@@ -102,7 +113,7 @@ class FaceDetectionTransformer : OperatorFactory {
                 }
 
                 val detections = try {
-                    FaceEmbedding.analyse(imageContent, host)
+                    FaceEmbeddingBase.analyse(imageContent, host, endpointPath)
                 } catch (e: Throwable) {
                     logger.error(e) { "Face detection call failed for retrievable ${retrievable.id}" }
                     emptyList()

@@ -17,15 +17,13 @@ import org.vitrivr.engine.core.math.correspondence.BoundedCorrespondence
 import org.vitrivr.engine.core.model.content.element.ContentElement
 import org.vitrivr.engine.core.model.content.element.ImageContent
 import org.vitrivr.engine.core.model.descriptor.vector.FloatVectorDescriptor
-import org.vitrivr.engine.core.model.metamodel.Analyser
 import org.vitrivr.engine.core.model.metamodel.Schema
 import org.vitrivr.engine.core.model.query.Query
-import org.vitrivr.engine.core.model.query.basics.Distance
 import org.vitrivr.engine.core.model.query.proximity.ProximityQuery
 import org.vitrivr.engine.core.model.retrievable.Retrievable
 import org.vitrivr.engine.core.model.types.Value
 import org.vitrivr.engine.core.operators.Operator
-import org.vitrivr.engine.core.operators.retrieve.Retriever
+import org.vitrivr.engine.core.operators.ingest.Extractor
 import org.vitrivr.engine.module.features.feature.external.ExternalAnalyser
 import org.vitrivr.engine.module.features.feature.external.logger
 import java.net.URLEncoder
@@ -33,48 +31,49 @@ import java.nio.charset.StandardCharsets
 import java.util.*
 
 /**
- * [ExternalAnalyser] for ArcFace-based face embeddings.
+ * Abstract base for face-embedding [ExternalAnalyser]s. Concrete subclasses pick a Python
+ * endpoint path and the embedding dimensionality, so multiple face models can coexist on the
+ * same descriptor server (e.g. ArcFace on '/extract/face_embedding_arcface', FaceNet on
+ * '/extract/face_embedding_facenet').
  *
- * Communicates with `/extract/face_embedding` on the Python descriptor server.
- * Returns one 512-d [FloatVectorDescriptor] **per detected face** (not a mean).
- * If no faces are found, returns an empty list.
+ * The HTTP plumbing and retriever wiring live here; subclasses only declare what makes them
+ * different. Pipeline ingestion is wired via [FaceDetectionTransformer], not via a per-class
+ * extractor — that's why [newExtractor] throws.
  */
-class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
+abstract class FaceEmbeddingBase : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
+
+    /** Path appended to the host URL to reach this model's endpoint on the Python server. */
+    abstract val endpointPath: String
+
+    /** Embedding vector length produced by this model. Drives [prototype] and the pgvector column width. */
+    abstract val embeddingDim: Int
 
     companion object {
+
         /**
-         * Requests per-face ArcFace detections for the given [ContentElement].
+         * Requests per-face detections + embeddings for the given [ContentElement].
          *
-         * The Python server returns a JSON array of [FaceDetectionResult] objects:
-         *   - 0 faces → `[]`
-         *   - N faces → `[{embedding, bbox, score}, ...]`
-         *
-         * @param content  The [ContentElement] for which to request face detections.
-         * @param hostname The hostname of the external feature descriptor service.
-         * @return A list of [FaceDetectionResult]s, one per detected face.
+         * @param content      The [ContentElement] for which to request face detections.
+         * @param hostname     Host URL of the Python descriptor server, e.g. `http://127.0.0.1:8888`.
+         * @param endpointPath Path on the server, e.g. `/extract/face_embedding_arcface`.
          */
-        fun analyse(content: ContentElement<*>, hostname: String): List<FaceDetectionResult> {
+        fun analyse(content: ContentElement<*>, hostname: String, endpointPath: String): List<FaceDetectionResult> {
             val requestBody = when (content) {
                 is ImageContent -> URLEncoder.encode(content.toDataUrl(), StandardCharsets.UTF_8.toString())
                 else -> throw IllegalArgumentException("Content '$content' not supported")
             }
-            val url = "$hostname/extract/face_embedding"
-            return httpRequestDetailed(url, "data=$requestBody")
+            return httpRequestDetailed("$hostname$endpointPath", "data=$requestBody")
         }
 
         /**
-         * Convenience wrapper: calls [analyse] and extracts just the embedding vectors as
-         * [FloatVectorDescriptor]s. Used by [FaceEmbeddingExtractor] and retrieval paths
-         * that only need the embedding.
+         * Convenience: calls [analyse] and projects to embedding-only descriptors. Used by the
+         * content-side retriever where bbox isn't needed.
          */
-        fun analyseEmbeddings(content: ContentElement<*>, hostname: String): List<FloatVectorDescriptor> =
-            analyse(content, hostname).map { det ->
+        fun analyseEmbeddings(content: ContentElement<*>, hostname: String, endpointPath: String): List<FloatVectorDescriptor> =
+            analyse(content, hostname, endpointPath).map { det ->
                 FloatVectorDescriptor(UUID.randomUUID(), null, Value.FloatVector(det.embedding.toFloatArray()))
             }
 
-        /**
-         * HTTP request that deserializes the rich per-face JSON response from the Python server.
-         */
         @OptIn(ExperimentalSerializationApi::class)
         private fun httpRequestDetailed(url: String, requestBody: String): List<FaceDetectionResult> = runBlocking {
             val body = requestBody.toByteArray(StandardCharsets.UTF_8)
@@ -98,12 +97,10 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
                     method = HttpMethod.Post
                     setBody(body)
                 }
-
                 if (!response.status.isSuccess()) {
                     logger.warn { "Non-success response: ${response.status.value} from $url" }
                     return@runBlocking emptyList()
                 }
-
                 response.bodyAsChannel().toInputStream().use { stream ->
                     Json.decodeFromStream<List<FaceDetectionResult>>(stream)
                 }
@@ -120,34 +117,33 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
     override val descriptorClass = FloatVectorDescriptor::class
 
     override fun prototype(field: Schema.Field<*, *>) =
-        FloatVectorDescriptor(UUID.randomUUID(), UUID.randomUUID(), Value.FloatVector(512))
+        FloatVectorDescriptor(UUID.randomUUID(), UUID.randomUUID(), Value.FloatVector(embeddingDim))
 
-    /* FaceEmbedding is wired into the pipeline via FaceDetectionTransformer (which writes face
-       embeddings as descriptors on FACE_DETECTION retrievables).*/
+    /* Wired into the pipeline via FaceDetectionTransformer, not a standalone extractor. */
     override fun newExtractor(
         field: Schema.Field<ImageContent, FloatVectorDescriptor>,
         input: Operator<out Retrievable>,
-        context: Context
-    ): org.vitrivr.engine.core.operators.ingest.Extractor<ImageContent, FloatVectorDescriptor> =
+        context: Context,
+    ): Extractor<ImageContent, FloatVectorDescriptor> =
         throw UnsupportedOperationException(
-            "FaceEmbedding does not provide a standalone extractor. " +
-                    "Wire face extraction via FaceDetectionTransformer in your ingest pipeline."
+            "${this::class.simpleName} does not provide a standalone extractor. " +
+                "Wire face extraction via FaceDetectionTransformer in your ingest pipeline."
         )
 
     override fun newExtractor(
         name: String,
         input: Operator<out Retrievable>,
-        context: Context
-    ): org.vitrivr.engine.core.operators.ingest.Extractor<ImageContent, FloatVectorDescriptor> =
+        context: Context,
+    ): Extractor<ImageContent, FloatVectorDescriptor> =
         throw UnsupportedOperationException(
-            "FaceEmbedding does not provide a standalone extractor. " +
-                    "Wire face extraction via FaceDetectionTransformer in your ingest pipeline."
+            "${this::class.simpleName} does not provide a standalone extractor. " +
+                "Wire face extraction via FaceDetectionTransformer in your ingest pipeline."
         )
 
     override fun newRetrieverForQuery(
         field: Schema.Field<ImageContent, FloatVectorDescriptor>,
         query: Query,
-        context: Context
+        context: Context,
     ): DenseRetriever<ImageContent> {
         require(query is ProximityQuery<*> && query.value is Value.FloatVector) {
             "The query is not a ProximityQuery<Value.FloatVector>."
@@ -157,17 +153,17 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
             field,
             query as ProximityQuery<Value.FloatVector>,
             context,
-            BoundedCorrespondence(0.0, 2.0)
+            BoundedCorrespondence(0.0, 2.0),
         )
     }
 
     override fun newRetrieverForContent(
         field: Schema.Field<ImageContent, FloatVectorDescriptor>,
         content: Map<String, ImageContent>,
-        context: Context
+        context: Context,
     ): DenseRetriever<ImageContent> {
         val host = field.parameters[HOST_PARAMETER_NAME] ?: HOST_PARAMETER_DEFAULT
-        val descriptors = content.values.flatMap { analyseEmbeddings(it, host) }
+        val descriptors = content.values.flatMap { analyseEmbeddings(it, host, endpointPath) }
         require(descriptors.isNotEmpty()) { "No faces detected in the query image." }
         return newRetrieverForDescriptors(field, descriptors, context)
     }
@@ -175,7 +171,7 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
     override fun newRetrieverForDescriptors(
         field: Schema.Field<ImageContent, FloatVectorDescriptor>,
         descriptors: Collection<FloatVectorDescriptor>,
-        context: Context
+        context: Context,
     ): DenseRetriever<ImageContent> {
         val k = context.getProperty(field.fieldName, "limit")?.toLongOrNull() ?: 1000L
         val fetchVector = context.getProperty(field.fieldName, "returnDescriptor")?.toBooleanStrictOrNull() ?: false
@@ -184,10 +180,10 @@ class FaceEmbedding : ExternalAnalyser<ImageContent, FloatVectorDescriptor>() {
             ProximityQuery(
                 value = descriptors.first().vector,
                 k = k,
-                distance = Distance.COSINE,
-                fetchVector = fetchVector
+                distance = org.vitrivr.engine.core.model.query.basics.Distance.COSINE,
+                fetchVector = fetchVector,
             ),
-            context
+            context,
         )
     }
 }
