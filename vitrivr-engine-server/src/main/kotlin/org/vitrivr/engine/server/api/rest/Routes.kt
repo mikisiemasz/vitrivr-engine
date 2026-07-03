@@ -67,11 +67,6 @@ fun configureApiRoutes(config: ApiConfig, manager: SchemaManager, executor: Exec
                         post("{clusterId}/split") { ctx -> splitCluster(ctx, schema) }
                         delete("{clusterId}") { ctx -> deleteCluster(ctx, schema) }
                     }
-                    path("tracks") {
-                        get("runs") { ctx -> listTrackRuns(ctx, schema) }
-                        post("run") { ctx -> triggerTracking(ctx, schema) }
-                        delete("runs/{runId}") { ctx -> deleteTrackRun(ctx, schema) }
-                    }
                 }
 
                 if (config.export) {

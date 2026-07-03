@@ -5,6 +5,8 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import io.javalin.http.Context
 import io.javalin.http.bodyAsClass
 import io.javalin.openapi.*
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 import org.vitrivr.engine.core.model.descriptor.struct.metadata.TemporalMetadataDescriptor
 import org.vitrivr.engine.core.model.descriptor.struct.metadata.source.FileSourceMetadataDescriptor
 import org.vitrivr.engine.core.model.descriptor.vector.FloatVectorDescriptor
@@ -237,7 +239,9 @@ fun listClusterRuns(ctx: Context, schema: Schema) {
             status = "COMPLETED",
         )
     }.toList()
-    ctx.json(runs)
+    ctx.contentType("application/json").result(
+        Json.encodeToString(ListSerializer(ClusterRunSummary.serializer()), runs)
+    )
 }
 
 @OpenApi(

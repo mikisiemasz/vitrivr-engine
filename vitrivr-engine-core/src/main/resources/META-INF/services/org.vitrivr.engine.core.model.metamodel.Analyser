@@ -5,5 +5,3 @@ org.vitrivr.engine.core.features.metadata.source.video.VideoSourceMetadata
 org.vitrivr.engine.core.features.metadata.temporal.TemporalMetadata
 org.vitrivr.engine.core.features.identity.ClusterCentroid
 org.vitrivr.engine.core.features.identity.ClusterLabel
-org.vitrivr.engine.core.features.identity.TrackEmbedding
-org.vitrivr.engine.core.features.identity.TrackMeta
