@@ -52,6 +52,10 @@ data class ClusteringParams(
     val embeddingFieldName: String? = null,
     val minClusterSize: Int = 5,
     val minSamples: Int = 3,
+    /* HDBSCAN cluster_selection_method: "eom" (stability-based; can merge identities linked by
+       low-density bridge faces into one mega-cluster at dataset scale) 
+       or "leaf" (finest granularity, might label many detections as noise). */
+    val clusterSelectionMethod: String = "eom",
     val pythonServerUrl: String = HOST_PARAMETER_DEFAULT,
     val exemplarCount: Int = 5,
     val labelCarryThreshold: Float = 0.6f,
@@ -93,6 +97,7 @@ private data class ClusterRequest(
     val detection_ids: List<String>,
     val min_cluster_size: Int,
     val min_samples: Int,
+    val cluster_selection_method: String = "eom",
 )
 
 @Serializable
@@ -257,6 +262,7 @@ class FaceClusteringService(
                 detection_ids = detectionIds.map { it.toString() },
                 min_cluster_size = params.minClusterSize,
                 min_samples = params.minSamples,
+                cluster_selection_method = params.clusterSelectionMethod,
             )
         )
         return try {

@@ -252,6 +252,12 @@ class SchemaCommand(private val schema: Schema, private val server: ExecutionSer
             help = "HDBSCAN min_samples."
         ).int().default(3)
 
+        private val clusterSelection: String by option(
+            "--cluster-selection",
+            help = "HDBSCAN cluster_selection_method: 'eom' (stability; may merge identities into " +
+                    "one mega-cluster at corpus scale) or 'leaf' (finest granularity)."
+        ).default("eom")
+
         private val pythonServer: String? by option(
             "--python-server",
             help = "Base URL of the Python descriptor server. Defaults to the '$HOST_PARAMETER_NAME' " +
@@ -270,6 +276,7 @@ class SchemaCommand(private val schema: Schema, private val server: ExecutionSer
                 embeddingFieldName = embeddingField,
                 minClusterSize = minClusterSize,
                 minSamples = minSamples,
+                clusterSelectionMethod = clusterSelection,
                 pythonServerUrl = resolvedHost,
             )
             logger.info { "Starting face clustering with params: $params" }

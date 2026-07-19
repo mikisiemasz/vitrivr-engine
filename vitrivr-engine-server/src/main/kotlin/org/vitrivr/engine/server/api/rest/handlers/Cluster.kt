@@ -46,11 +46,15 @@ private fun exemplarIdsOf(schema: Schema, clusterId: UUID): List<UUID> =
 
 private fun parentMapOf(schema: Schema, faceIds: Collection<UUID>): Map<UUID, UUID> {
     if (faceIds.isEmpty()) return emptyMap()
-    return schema.connection.getRetrievableReader().getConnections(
-        subjectIds = faceIds,
-        predicates = listOf("partOf"),
-        objectIds = emptyList(),
-    ).associate { it.subjectId to it.objectId }
+    /* Chunked: a mega-cluster can hold >65k members, and Postgres prepared statements
+       cap at 65,535 parameters. */
+    return faceIds.chunked(30_000).flatMap { batch ->
+        schema.connection.getRetrievableReader().getConnections(
+            subjectIds = batch,
+            predicates = listOf("partOf"),
+            objectIds = emptyList(),
+        ).map { it.subjectId to it.objectId }.toList()
+    }.toMap()
 }
 
 /**
@@ -255,6 +259,7 @@ fun listClusterRuns(ctx: Context, schema: Schema) {
         OpenApiParam("embeddingField", type = String::class),
         OpenApiParam("minClusterSize", type = Int::class),
         OpenApiParam("minSamples", type = Int::class),
+        OpenApiParam("clusterSelectionMethod", type = String::class, description = "eom | leaf"),
         OpenApiParam("exemplarCount", type = Int::class),
         OpenApiParam("labelCarryThreshold", type = Float::class),
         OpenApiParam("pythonServer", type = String::class),
@@ -283,6 +288,10 @@ fun triggerClustering(ctx: Context, schema: Schema) {
         embeddingFieldName = embeddingFieldName,
         minClusterSize = ctx.queryParam("minClusterSize")?.toIntOrNull() ?: 5,
         minSamples = ctx.queryParam("minSamples")?.toIntOrNull() ?: 3,
+        clusterSelectionMethod = when (val m = ctx.queryParam("clusterSelectionMethod")?.lowercase()) {
+            null, "eom", "leaf" -> m ?: "eom"
+            else -> throw ErrorStatusException(400, "Invalid clusterSelectionMethod '$m'; expected 'eom' or 'leaf'.")
+        },
         exemplarCount = ctx.queryParam("exemplarCount")?.toIntOrNull() ?: 5,
         labelCarryThreshold = ctx.queryParam("labelCarryThreshold")?.toFloatOrNull() ?: 0.6f,
         pythonServerUrl = resolvedHost,
@@ -746,29 +755,36 @@ fun getClusterCoOccurrences(ctx: Context, schema: Schema) {
         return
     }
 
-    /* All face detections appearing in those segments, with their parent segments. */
-    val faceParentMap = reader.getConnections(
-        subjectIds = emptyList(),
-        predicates = listOf("partOf"),
-        objectIds = mySegments,
-    ).associate { it.subjectId to it.objectId } // face -> segment
+    /* All face detections appearing in those segments, with their parent segments.
+       Chunked: a mega-cluster's segment set can exceed the 65,535-param statement cap. */
+    val faceParentMap: Map<UUID, UUID> = mySegments.chunked(30_000).flatMap { batch ->
+        reader.getConnections(
+            subjectIds = emptyList(),
+            predicates = listOf("partOf"),
+            objectIds = batch,
+        ).map { it.subjectId to it.objectId }.toList()
+    }.toMap() // face -> segment
 
     /* Walk from face → cluster-membership. Path depends on partnerTarget:
        - detections: face → memberOfCluster (direct)
        - tracks:     face → partOfTrack → memberOfCluster (track's cluster) */
     val faceToCandidateClusters: List<Pair<UUID, UUID>> = if (partnerTarget == "FACE_DETECTION") {
-        reader.getConnections(
-            subjectIds = faceParentMap.keys,
-            predicates = listOf("memberOfCluster"),
-            objectIds = emptyList(),
-        ).map { it.subjectId to it.objectId }.toList()
+        faceParentMap.keys.chunked(30_000).flatMap { batch ->
+            reader.getConnections(
+                subjectIds = batch,
+                predicates = listOf("memberOfCluster"),
+                objectIds = emptyList(),
+            ).map { it.subjectId to it.objectId }.toList()
+        }
     } else {
         /* face → track */
-        val faceToTrack = reader.getConnections(
-            subjectIds = faceParentMap.keys,
-            predicates = listOf("partOfTrack"),
-            objectIds = emptyList(),
-        ).map { it.subjectId to it.objectId }.toList()
+        val faceToTrack = faceParentMap.keys.chunked(30_000).flatMap { batch ->
+            reader.getConnections(
+                subjectIds = batch,
+                predicates = listOf("partOfTrack"),
+                objectIds = emptyList(),
+            ).map { it.subjectId to it.objectId }.toList()
+        }
         val trackIds = faceToTrack.map { it.second }.distinct()
         /* track → cluster, chunked. */
         val trackToCluster: Map<UUID, UUID> = trackIds.chunked(30_000).flatMap { batch ->
@@ -956,9 +972,11 @@ fun splitCluster(ctx: Context, schema: Schema) {
         fun recomputeCentroid(clusterId: UUID) {
             val members = memberIdsOf(schema, clusterId)
             if (members.isEmpty()) { state.remove(clusterId); return }
-            val vectors = embReader.getAllForRetrievable(members)
-                .mapNotNull { it.retrievableId?.let { _ -> it.vector.value } }
-                .toList()
+            val vectors = members.chunked(30_000).flatMap { batch ->
+                embReader.getAllForRetrievable(batch)
+                    .mapNotNull { it.retrievableId?.let { _ -> it.vector.value } }
+                    .toList()
+            }
             if (vectors.isEmpty()) return
             state.setCentroid(clusterId, FaceClusteringService.computeMeanNormalized(vectors))
         }
@@ -1309,7 +1327,8 @@ fun deleteClusterRun(ctx: Context, schema: Schema) {
 @OpenApi(
     path = "/api/{schema}/clusters/match",
     methods = [HttpMethod.POST],
-    summary = "Server-side AND-intersection of cluster memberships, with optional spatial ordering.",
+    summary = "Server-side AND-intersection of cluster memberships, with optional spatial ordering " +
+              "or temporal sequencing (each next person appearing within a window after the previous).",
     operationId = "matchClusters",
     tags = ["Cluster"],
     pathParams = [OpenApiParam("schema", type = String::class, required = true)],
@@ -1326,19 +1345,31 @@ fun matchClusters(ctx: Context, schema: Schema) {
     val include = body.include.map { parseUuidOrThrow(it, "include cluster") }.toSet()
     val exclude = body.exclude.map { parseUuidOrThrow(it, "exclude cluster") }.toSet()
     val spatialOrder = body.spatialOrder?.map { parseUuidOrThrow(it, "spatialOrder cluster") }
+    val temporalOrder = body.temporalOrder?.map { parseUuidOrThrow(it, "temporalOrder cluster") }
     val axis = body.axis.lowercase().also {
         require(it == "x" || it == "y") { "axis must be 'x' or 'y'." }
     }
     val limit = body.limit.coerceAtLeast(1)
 
-    if (include.isEmpty() && spatialOrder.isNullOrEmpty()) {
-        throw ErrorStatusException(400, "Must specify at least one include or spatialOrder cluster.")
+    if (include.isEmpty() && spatialOrder.isNullOrEmpty() && temporalOrder.isNullOrEmpty()) {
+        throw ErrorStatusException(400, "Must specify at least one include, spatialOrder or temporalOrder cluster.")
+    }
+    if (!temporalOrder.isNullOrEmpty()) {
+        if (!spatialOrder.isNullOrEmpty()) {
+            throw ErrorStatusException(400, "spatialOrder and temporalOrder are mutually exclusive.")
+        }
+        if (temporalOrder.size < 2) {
+            throw ErrorStatusException(400, "temporalOrder needs at least 2 clusters.")
+        }
+        if (body.temporalWindowS <= 0f) {
+            throw ErrorStatusException(400, "temporalWindowS must be > 0.")
+        }
     }
 
     val reader = schema.connection.getRetrievableReader()
 
-    /* All clusters we care about (membership + spatial). */
-    val allClusters = include + exclude + (spatialOrder?.toSet() ?: emptySet())
+    /* All clusters we care about (membership + spatial + temporal). */
+    val allClusters = include + exclude + (spatialOrder?.toSet() ?: emptySet()) + (temporalOrder?.toSet() ?: emptySet())
 
     /* face -> cluster, but only for faces in the requested clusters. Uses detectionIdsOfCluster
        so both detection-clusters and track-clusters resolve to face ids uniformly. A face that's
@@ -1368,6 +1399,97 @@ fun matchClusters(ctx: Context, schema: Schema) {
             .computeIfAbsent(segmentId) { mutableMapOf() }
             .computeIfAbsent(clusterId) { mutableListOf() }
             .add(faceId)
+    }
+
+    /* Temporal-sequence constraint. Evaluated on per-video appearance intervals rather than
+       single segments — the ordered persons appear in *different* segments, so the include-
+       intersection below does not apply. Exclusion still applies to the emitted segments,
+       which are the LAST person's (the sequence-completion event). */
+    if (!temporalOrder.isNullOrEmpty()) {
+        val windowNs = (body.temporalWindowS.toDouble() * 1e9).toLong()
+        val maxGapNs = (body.temporalMaxGapS.toDouble() * 1e9).toLong().coerceAtLeast(0L)
+        val anchorEnd = body.temporalAnchor.equals("end", ignoreCase = true)
+
+        /* Times + source for every segment where any requested cluster appears. */
+        val segInfo = segmentDisplayInfoFor(schema, segmentClusterFaces.keys)
+
+        /* One person's continuous on-screen appearance: consecutive segments coalesced. */
+        data class Appearance(val startNs: Long, var endNs: Long, val segmentIds: MutableList<UUID>)
+
+        /* Per ordered cluster: source -> appearance intervals, time-sorted and gap-bridged. */
+        fun appearancesOf(cid: UUID): Map<UUID, List<Appearance>> {
+            val bySource = mutableMapOf<UUID, MutableList<Triple<Long, Long, UUID>>>()
+            for ((seg, byCluster) in segmentClusterFaces) {
+                if (cid !in byCluster.keys) continue
+                val d = segInfo[seg] ?: continue
+                val src = d.sourceId ?: continue
+                val s = d.startNs ?: continue
+                val e = d.endNs ?: continue
+                bySource.computeIfAbsent(src) { mutableListOf() }.add(Triple(s, e, seg))
+            }
+            return bySource.mapValues { (_, list) ->
+                val out = mutableListOf<Appearance>()
+                for ((s, e, seg) in list.sortedBy { it.first }) {
+                    val last = out.lastOrNull()
+                    if (last != null && s - last.endNs <= maxGapNs) {
+                        last.endNs = maxOf(last.endNs, e)
+                        last.segmentIds.add(seg)
+                    } else {
+                        out.add(Appearance(s, e, mutableListOf(seg)))
+                    }
+                }
+                out
+            }
+        }
+
+        val perCluster: List<Map<UUID, List<Appearance>>> = temporalOrder.map { appearancesOf(it) }
+
+        /* Chain-join per source video: each next person's appearance must start within the
+           window after the previous appearance's anchor. Hop score 1 - lag/window; a chain's
+           score is the mean over its hops. Segment keeps the best chain score that reaches it. */
+        data class Chain(val last: Appearance, val scoreSum: Float)
+        val hitScores = mutableMapOf<UUID, Float>()
+        for (src in perCluster.first().keys) {
+            var chains = perCluster.first()[src].orEmpty().map { Chain(it, 0f) }
+            for (k in 1 until perCluster.size) {
+                val nextApps = perCluster[k][src].orEmpty()
+                chains = chains.flatMap { chain ->
+                    val anchor = if (anchorEnd) chain.last.endNs else chain.last.startNs
+                    nextApps.mapNotNull { app ->
+                        val lag = app.startNs - anchor
+                        if (lag < 0 || lag > windowNs) null
+                        else Chain(app, chain.scoreSum + (1f - lag.toFloat() / windowNs))
+                    }
+                }
+                if (chains.isEmpty()) break
+            }
+            for (chain in chains) {
+                val score = chain.scoreSum / (perCluster.size - 1)
+                for (seg in chain.last.segmentIds) {
+                    val present = segmentClusterFaces[seg]?.keys.orEmpty()
+                    if (exclude.any { it in present }) continue
+                    hitScores.merge(seg, score, ::maxOf)
+                }
+            }
+        }
+
+        val topHits = hitScores.entries.sortedByDescending { it.value }.take(limit)
+        ctx.json(ClusterMatchResponse(
+            total = hitScores.size,
+            limit = limit,
+            results = topHits.map { (segId, score) ->
+                val d = segInfo[segId]
+                ClusterMatchHit(
+                    segmentId = segId.toString(),
+                    score = score,
+                    sourceId = d?.sourceId?.toString(),
+                    filePath = d?.filePath,
+                    startNs = d?.startNs,
+                    endNs = d?.endNs,
+                )
+            },
+        ))
+        return
     }
 
     /* Apply include/exclude filter. */

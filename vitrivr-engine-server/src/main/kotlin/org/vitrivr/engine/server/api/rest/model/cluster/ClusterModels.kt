@@ -220,6 +220,12 @@ data class GroupSizeHistogramResponse(
  * that satisfy the include/exclude clauses, only segments where the listed clusters appear in
  * the requested order along [axis] are returned. The score is the mean margin between
  * consecutive positions — larger is cleaner.
+ *
+ * Optional [temporalOrder] instead adds a temporal-sequence constraint ("X appears, then Y
+ * within N seconds"): each next cluster's appearance must begin within [temporalWindowS] after
+ * the previous cluster's [temporalAnchor]. The ordered persons appear in *different* segments,
+ * so this replaces the include-intersection; [exclude] still applies to the emitted segments
+ * (the last person's — the sequence-completion event). Mutually exclusive with [spatialOrder].
  */
 @Serializable
 data class ClusterMatchRequest(
@@ -227,6 +233,16 @@ data class ClusterMatchRequest(
     val exclude: List<String> = emptyList(),
     val spatialOrder: List<String>? = null,
     val axis: String = "x",
+    /** Ordered clusterIds for the temporal-sequence constraint. Requires >= 2 entries. */
+    val temporalOrder: List<String>? = null,
+    /** Max lag in seconds between consecutive persons in [temporalOrder]. */
+    val temporalWindowS: Float = 20f,
+    /** Anchor on the previous appearance the window counts from: "start" (moment the person
+        first appears) or "end" (moment they disappear). */
+    val temporalAnchor: String = "start",
+    /** Gaps up to this many seconds between a person's segments are bridged into one
+        continuous appearance before sequencing. */
+    val temporalMaxGapS: Float = 2f,
     val limit: Int = 200,
 )
 
