@@ -270,6 +270,33 @@ data class ClusterMatchResponse(
 )
 
 /**
+ * Request body for `POST /segments/info`: bulk display-metadata lookup for SEGMENT ids.
+ *
+ * Exists because the generic query pipeline cannot deliver source path / time for
+ * FACE_DETECTION result streams (the lookups reach one relationship hop; `file.path`
+ * lives two hops away on the SOURCE), so the frontend resolves them here instead.
+ */
+@Serializable
+data class SegmentInfoRequest(
+    val ids: List<String> = emptyList(),
+)
+
+@Serializable
+data class SegmentInfoItem(
+    val segmentId: String,
+    val sourceId: String? = null,
+    /** `file.path` of the parent SOURCE; null when unresolvable. */
+    val filePath: String? = null,
+    val startNs: Long? = null,
+    val endNs: Long? = null,
+)
+
+@Serializable
+data class SegmentInfoResponse(
+    val segments: List<SegmentInfoItem>,
+)
+
+/**
  * Request body for `POST /clusters/identify`.
  *
  * Given a face embedding, returns the clusters whose centroids are most

@@ -196,6 +196,35 @@ private fun segmentDisplayInfoFor(
 }
 
 @OpenApi(
+    path = "/api/{schema}/segments/info",
+    methods = [HttpMethod.POST],
+    summary = "Bulk display-metadata lookup for SEGMENT ids: parent source id, its file.path and " +
+            "the segment's start/end time. Fills the gap left by the query pipeline, which cannot " +
+            "attach source-level descriptors to FACE_DETECTION result streams.",
+    operationId = "getSegmentInfo",
+    tags = ["Segment"],
+    pathParams = [OpenApiParam("schema", type = String::class, required = true)],
+    requestBody = OpenApiRequestBody([OpenApiContent(SegmentInfoRequest::class)]),
+    responses = [OpenApiResponse("200", [OpenApiContent(SegmentInfoResponse::class)])]
+)
+fun getSegmentInfo(ctx: Context, schema: Schema) {
+    val body = runCatching { ctx.bodyAsClass<SegmentInfoRequest>() }
+        .getOrElse { throw ErrorStatusException(400, "Invalid request body: ${it.message}") }
+    val ids = body.ids.mapNotNull { runCatching { UUID.fromString(it) }.getOrNull() }.distinct().take(2000)
+    val info = segmentDisplayInfoFor(schema, ids)
+    ctx.json(SegmentInfoResponse(ids.map { id ->
+        val i = info[id]
+        SegmentInfoItem(
+            segmentId = id.toString(),
+            sourceId = i?.sourceId?.toString(),
+            filePath = i?.filePath,
+            startNs = i?.startNs,
+            endNs = i?.endNs,
+        )
+    }))
+}
+
+@OpenApi(
     path = "/api/{schema}/clusters/runs",
     methods = [HttpMethod.GET],
     summary = "Lists all FACE_CLUSTER_RUN retrievables for the given schema.",
@@ -260,6 +289,7 @@ fun listClusterRuns(ctx: Context, schema: Schema) {
         OpenApiParam("minClusterSize", type = Int::class),
         OpenApiParam("minSamples", type = Int::class),
         OpenApiParam("clusterSelectionMethod", type = String::class, description = "eom | leaf"),
+        OpenApiParam("pathLike", type = String::class, description = "Only cluster detections whose source path contains this substring (chunk-wise clustering)."),
         OpenApiParam("exemplarCount", type = Int::class),
         OpenApiParam("labelCarryThreshold", type = Float::class),
         OpenApiParam("pythonServer", type = String::class),
@@ -292,6 +322,7 @@ fun triggerClustering(ctx: Context, schema: Schema) {
             null, "eom", "leaf" -> m ?: "eom"
             else -> throw ErrorStatusException(400, "Invalid clusterSelectionMethod '$m'; expected 'eom' or 'leaf'.")
         },
+        pathFilter = ctx.queryParam("pathLike")?.takeIf { it.isNotBlank() },
         exemplarCount = ctx.queryParam("exemplarCount")?.toIntOrNull() ?: 5,
         labelCarryThreshold = ctx.queryParam("labelCarryThreshold")?.toFloatOrNull() ?: 0.6f,
         pythonServerUrl = resolvedHost,

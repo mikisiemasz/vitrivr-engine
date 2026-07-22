@@ -258,6 +258,13 @@ class SchemaCommand(private val schema: Schema, private val server: ExecutionSer
                     "one mega-cluster at corpus scale) or 'leaf' (finest granularity)."
         ).default("eom")
 
+        private val pathLike: String? by option(
+            "--path-like",
+            help = "Only cluster detections whose source video path contains this substring " +
+                    "(e.g. '/day1/Kitchen/'). Chunk-wise clustering keeps per-run density low " +
+                    "enough for 'eom' to separate identities."
+        )
+
         private val pythonServer: String? by option(
             "--python-server",
             help = "Base URL of the Python descriptor server. Defaults to the '$HOST_PARAMETER_NAME' " +
@@ -277,6 +284,7 @@ class SchemaCommand(private val schema: Schema, private val server: ExecutionSer
                 minClusterSize = minClusterSize,
                 minSamples = minSamples,
                 clusterSelectionMethod = clusterSelection,
+                pathFilter = pathLike,
                 pythonServerUrl = resolvedHost,
             )
             logger.info { "Starting face clustering with params: $params" }

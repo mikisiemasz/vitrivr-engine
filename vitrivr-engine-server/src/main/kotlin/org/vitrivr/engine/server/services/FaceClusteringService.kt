@@ -7,6 +7,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
+import org.vitrivr.engine.core.model.descriptor.struct.metadata.source.FileSourceMetadataDescriptor
 import org.vitrivr.engine.core.model.descriptor.vector.FloatVectorDescriptor
 import org.vitrivr.engine.core.model.metamodel.Schema
 import org.vitrivr.engine.core.model.relationship.Relationship
@@ -56,6 +57,8 @@ data class ClusteringParams(
        low-density bridge faces into one mega-cluster at dataset scale) 
        or "leaf" (finest granularity, might label many detections as noise). */
     val clusterSelectionMethod: String = "eom",
+    /* Substring filter on the source video path  */
+    val pathFilter: String? = null,
     val pythonServerUrl: String = HOST_PARAMETER_DEFAULT,
     val exemplarCount: Int = 5,
     val labelCarryThreshold: Float = 0.6f,
@@ -134,8 +137,14 @@ class FaceClusteringService(
 
         val reader = schema.connection.getRetrievableReader()
         val inputType = params.inputRetrievableType()
-        val detections = reader.getAll(inputType).toList()
-        logger.info { "[Clustering] Found ${detections.size} $inputType retrievables (target=${params.target})." }
+        val allDetections = reader.getAll(inputType).toList()
+        logger.info { "[Clustering] Found ${allDetections.size} $inputType retrievables (target=${params.target})." }
+
+        val detections = params.pathFilter?.let { pf ->
+            val kept = filterBySourcePath(allDetections.map { it.id }, pf)
+            logger.info { "[Clustering] Path filter '$pf' keeps ${kept.size} of ${allDetections.size}." }
+            allDetections.filter { it.id in kept }
+        } ?: allDetections
         if (detections.isEmpty()) return emptyRun(params, startedAt, "NO_INPUTS")
 
         val embeddingFieldName = params.effectiveEmbeddingFieldName()
@@ -247,6 +256,42 @@ class FaceClusteringService(
             completedAt = completedAt,
             status = "COMPLETED",
         )
+    }
+
+    /**
+     * Detection ids whose source video path contains [pathFilter] (case-sensitive substring).
+     * Walks detection → segment → source via partOf, then reads the source's file descriptor.
+     * All lookups chunked to stay under the 65,535-parameter statement cap.
+     */
+    private fun filterBySourcePath(detectionIds: List<RetrievableId>, pathFilter: String): Set<RetrievableId> {
+        val reader = schema.connection.getRetrievableReader()
+
+        val detToSeg: Map<RetrievableId, RetrievableId> = detectionIds.chunked(30_000).flatMap { batch ->
+            reader.getConnections(subjectIds = batch, predicates = listOf("partOf"), objectIds = emptyList())
+                .map { it.subjectId to it.objectId }.toList()
+        }.toMap()
+
+        val segToSrc: Map<RetrievableId, RetrievableId> = detToSeg.values.distinct().chunked(30_000)
+            .flatMap { batch ->
+                reader.getConnections(subjectIds = batch, predicates = listOf("partOf"), objectIds = emptyList())
+                    .map { it.subjectId to it.objectId }.toList()
+            }.toMap()
+
+        @Suppress("UNCHECKED_CAST")
+        val fileField = schema["file"] as? Schema.Field<*, FileSourceMetadataDescriptor>
+            ?: run {
+                logger.error { "[Clustering] Path filter requires a 'file' field on the schema; keeping nothing." }
+                return emptySet()
+            }
+        val matchingSources: Set<RetrievableId> = segToSrc.values.distinct().chunked(30_000)
+            .flatMap { batch -> fileField.getReader().getAllForRetrievable(batch).toList() }
+            .filter { it.path.value.contains(pathFilter) }
+            .mapNotNull { it.retrievableId }
+            .toSet()
+
+        return detectionIds.filterTo(mutableSetOf()) { det ->
+            detToSeg[det]?.let { seg -> segToSrc[seg] in matchingSources } == true
+        }
     }
 
     @OptIn(ExperimentalSerializationApi::class)
